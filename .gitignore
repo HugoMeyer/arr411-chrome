@@ -1,0 +1,4 @@
+# Packaged extension and signing key
+*.zip
+*.crx
+*.pem

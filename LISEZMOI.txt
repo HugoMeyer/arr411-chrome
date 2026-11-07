@@ -1,0 +1,15 @@
+C411 -> qBittorrent (extension Chrome)
+
+Installation :
+1. Place ce dossier quelque part ou il restera (ne pas le supprimer ensuite).
+2. Ouvre chrome://extensions et active le "Mode developpeur" (en haut a droite).
+3. Clique "Charger l'extension non empaquetee" et choisis ce dossier (celui qui contient manifest.json).
+4. Clic droit sur l'icone de l'extension > Options :
+   - qBittorrent : URL de la WebUI, utilisateur, mot de passe, puis "Tester".
+   - Radarr / Sonarr / Lidarr (facultatif) : URL + cle API (Parametres > General), puis "Tester".
+   Chrome demandera l'autorisation d'acceder a tes serveurs : accepte.
+5. Va sur C411 (F5 si la page etait deja ouverte) : un bouton "qBittorrent" apparait a cote de "Telecharger".
+
+Radarr/Sonarr/Lidarr : les films/series/albums sont ajoutes NON surveilles, sans recherche automatique.
+Lidarr : categorie qBittorrent "lidarr" par defaut. L'album est detecte grace a la fiche musique de C411
+(MusicBrainz/Deezer/Discogs) ; artiste et album restent modifiables avant l'envoi.
