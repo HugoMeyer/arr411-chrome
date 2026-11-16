@@ -10,6 +10,10 @@ Installation :
    Chrome demandera l'autorisation d'acceder a tes serveurs : accepte.
 5. Va sur C411 (F5 si la page etait deja ouverte) : un bouton "qBittorrent" apparait a cote de "Telecharger".
 
+Badges de score : sur la page d'un torrent, dans la liste "Versions" et dans les resultats, une pastille de 0 a 100
+note chaque version (langue, qualite, seeders, taille). Etoile = meilleur choix, balance = meilleur rapport
+qualite/taille, losange = meilleure qualite, eclair = plus de seeders. Clique sur la pastille pour le detail.
+
 Radarr/Sonarr/Lidarr : les films/series/albums sont ajoutes NON surveilles, sans recherche automatique.
 Lidarr : categorie qBittorrent "lidarr" par defaut. L'album est detecte grace a la fiche musique de C411
 (MusicBrainz/Deezer/Discogs) ; artiste et album restent modifiables avant l'envoi.

@@ -1,5 +1,7 @@
 (() => {
   const MARK = 'data-qbt-injected';
+  const SCORE = 'data-qbt-score';
+  const SCORE_TRACK_PX = 60;
   const ARM_TIMEOUT_MS = 20000;
   let armTimer = null;
 
@@ -18,7 +20,7 @@
     });
   }
 
-  function toast(text, isError = false) {
+  function toast(text, isError = false, neutral = false) {
     let box = document.getElementById('qbt-toasts');
     if (!box) {
       box = document.createElement('div');
@@ -33,11 +35,11 @@
     el.textContent = text;
     Object.assign(el.style, {
       padding: '12px 16px', borderRadius: '8px', font: '14px system-ui, sans-serif',
-      color: '#fff', background: isError ? '#c0392b' : '#27ae60',
-      boxShadow: '0 4px 16px rgba(0,0,0,.3)', maxWidth: '400px'
+      color: '#fff', background: neutral ? '#334155' : isError ? '#c0392b' : '#27ae60',
+      boxShadow: '0 4px 16px rgba(0,0,0,.3)', maxWidth: '400px', whiteSpace: 'pre-line'
     });
     box.appendChild(el);
-    setTimeout(() => el.remove(), isError ? 8000 : 5000);
+    setTimeout(() => el.remove(), neutral ? 9000 : isError ? 8000 : 5000);
   }
 
   const MUSIC_SOURCES = ['Deezer', 'MusicBrainz', 'Discogs', 'NFO (partiel)'];
@@ -547,23 +549,26 @@
     return null;
   }
 
-  // On desktop, the download-icon column (the last one) is doubled so that our icon fits next to C411's.
+  // On desktop, the download-icon column (the last one) is doubled so that our icon fits next to C411's,
+  // and a column is added after it for the score badge.
   // The rule targets the class itself: rows and header sharing it stay aligned, rows added later are
   // covered, and the mobile layout (below Tailwind's `lg` breakpoint) is left untouched.
-  const gridRules = new Map();
+  const widenedGrids = new Set();
+  const scoredGrids = new Set();
 
-  function widenColumn(token) {
-    if (gridRules.has(token)) return;
+  // '' when the last track is not a fixed size: such a template is left alone.
+  function gridRule(token) {
     const cols = token.slice('lg:grid-cols-['.length, -1).split('_');
     const last = /^(\d+(?:\.\d+)?)px$/.exec(cols[cols.length - 1]);
-    if (!last) { gridRules.set(token, ''); return; }
-    cols[cols.length - 1] = `${Number(last[1]) * 2}px`;
+    if (!last) return '';
+    if (widenedGrids.has(token)) cols[cols.length - 1] = `${Number(last[1]) * 2}px`;
+    if (scoredGrids.has(token)) cols.push(`${SCORE_TRACK_PX}px`);
     const sel = `.${CSS.escape(token)}`;
-    gridRules.set(token, `@media (min-width: 64rem) { ${sel}${sel} { grid-template-columns: ${cols.join(' ')}; } }`);
+    return `@media (min-width: 64rem) { ${sel}${sel} { grid-template-columns: ${cols.join(' ')}; } }`;
   }
 
   function applyGridRules() {
-    const css = [...gridRules.values()].filter(Boolean).join('\n');
+    const css = [...new Set([...widenedGrids, ...scoredGrids])].map(gridRule).filter(Boolean).join('\n');
     if (!css) return;
     let style = document.getElementById('qbt-style');
     if (!style) {
@@ -628,7 +633,7 @@
       const listed = label === 'Télécharger'
         || (label === null && !grid && hasDownloadIcon(btn) && !!btn.closest('a[href*="/torrents/"]'));
       if (!listed) continue;
-      if (grid) widenColumn(gridToken(grid));
+      if (grid) widenedGrids.add(gridToken(grid));
       pairUp(btn, () => listButton(btn, grid || btn.parentElement));
     }
     applyGridRules();
@@ -679,9 +684,11 @@
   }
 
   function existingPillAt(ref, where) {
-    const el = where === 'beforebegin' ? ref.previousElementSibling
+    let el = where === 'beforebegin' ? ref.previousElementSibling
       : where === 'beforeend' ? ref.lastElementChild
         : ref.nextElementSibling;
+    // A score badge may sit between the reference and the pill.
+    while (el && el.hasAttribute(SCORE)) el = where === 'afterend' ? el.nextElementSibling : el.previousElementSibling;
     return !!(el && el.hasAttribute(PILL));
   }
 
@@ -729,8 +736,542 @@
     }
   }
 
+  // ---------- Scoring badges: release parsing and score ----------
+
+  // ==== scoring:begin ====
+  // Pure part: nothing in this block touches the DOM. test/scoring.test.js evaluates it as it is.
+  const QUALITY_EXP = 2;
+  const SIZE_EXP = 0.55;
+  const WEIGHTS = { lang: 30, quality: 30, health: 20, size: 20 };
+  const QUALITY_MAX = { res: 12, src: 8, hdr: 4, audio: 4, codec: 2 };
+  const LANG_MAX = 30;
+  const LANG_UNKNOWN = 6;
+  const DEAD_CAP = 35;
+
+  // Lowercase, no accents, dot-separated: each token can be matched as `.token.`.
+  const flat = (s) => '.' + String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/hdr10\+/g, 'hdr10plus').replace(/dd\+/g, 'ddp').replace(/e-ac-3/g, 'eac3')
+    .replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '') + '.';
+
+  // [pattern, points, label]. For languages, resolutions and sources the first match wins.
+  const LANGS = [
+    [/\.multi\.(?:vff|truefrench)\./, 30, 'MULTI.VFF'],
+    [/\.multi\.vof\./, 30, 'MULTI.VOF'],
+    [/\.multi\.vf2\./, 29, 'MULTI.VF2'],
+    [/\.multi\.vfi\./, 27, 'MULTI.VFi'],
+    [/\.multi\.vfq\./, 26, 'MULTI.VFQ'],
+    [/\.multi\./, 25, 'MULTI'],
+    [/\.vof\./, 30, 'VOF'],
+    [/\.(?:vff|truefrench)\./, 24, 'VFF'],
+    [/\.vf2\./, 23, 'VF2'],
+    [/\.(?:french|vf)\./, 21, 'FRENCH'],
+    [/\.vfi\./, 20, 'VFi'],
+    [/\.vfq\./, 18, 'VFQ'],
+    [/\.(?:vostfr|subfrench)\./, 10, 'VOSTFR'],
+    [/\.vost\./, 8, 'VOST'],
+    [/\.vo\./, 4, 'VO']
+  ];
+  const RESOLUTIONS = [
+    [/\.(?:2160p|4k|uhd)\./, 12, '2160p'],
+    [/\.1080[pi]\./, 8, '1080p'],
+    [/\.720p\./, 4, '720p'],
+    [/\.(?:576|480|360)[pi]\./, 1, 'SD']
+  ];
+  const SOURCES = [
+    [/\.remux\./, 8, 'Remux'],
+    [/\.bdmv\./, 8, 'BDMV'],
+    [/\.4klight\./, 6, '4KLight'],
+    [/\.hdlight\./, 6, 'HDLight'],
+    [/\.(?:bluray|blu\.ray|bdrip|brrip|bd)\./, 7, 'BluRay'],
+    [/\.(?:web\.dl|webdl)\./, 7, 'WEB-DL'],
+    [/\.webrip\./, 5, 'WEBRip'],
+    [/\.(?:hdtv|pdtv|tvrip|hdrip)\./, 3, 'HDTV'],
+    [/\.dvdrip\./, 2, 'DVDRip'],
+    [/\.(?:cam|camrip|hdcam|telesync|ts|tc)\./, 0, 'CAM'],
+    [/\.web\./, 7, 'WEB']
+  ];
+  const HDRS = [
+    [/\.(?:dv|dovi|dolby\.vision)\./, 4, 'DV'],
+    [/\.hdr10plus\./, 4, 'HDR10+'],
+    [/\.hdr10\./, 3, 'HDR10'],
+    [/\.(?:hdr|hlg)\./, 3, 'HDR'],
+    [/\.sdr\./, 0, 'SDR']
+  ];
+  const AUDIOS = [
+    [/\.truehd\./, 4, 'TrueHD'],
+    [/\.atmos\./, 4, 'Atmos'],
+    [/\.(?:dts\.hd|dtshd)\./, 4, 'DTS-HD'],
+    [/\.(?:dts\.x|dtsx)\./, 4, 'DTS:X'],
+    [/\.flac\./, 4, 'FLAC'],
+    [/\.(?:eac3|ddp)\d*\./, 3, 'EAC3'],
+    [/\.dts\d*\./, 3, 'DTS'],
+    [/\.(?:ac3|dd)\d*\./, 2, 'AC3'],
+    [/\.aac\d*\./, 2, 'AAC'],
+    [/\.opus\d*\./, 2, 'Opus'],
+    [/\.mp3\./, 1, 'MP3']
+  ];
+  const CODECS = [
+    [/\.av1\./, 1.5, 'AV1'],
+    [/\.(?:x265|h\.?265|hevc)\./, 2, 'H.265'],
+    [/\.(?:x264|h\.?264|avc)\./, 1, 'H.264'],
+    [/\.(?:xvid|divx|mpeg2|vc1)\./, 0, 'XviD']
+  ];
+
+  const matches = (f, table) => table.filter(([re]) => re.test(f));
+  const firstOf = (f, table) => {
+    const hit = matches(f, table)[0];
+    return hit ? { label: hit[2], pts: hit[1] } : null;
+  };
+  const bestOf = (f, table) => {
+    const hits = matches(f, table);
+    if (!hits.length) return null;
+    const top = hits.reduce((a, b) => (b[1] > a[1] ? b : a));
+    return { label: top[2], pts: top[1] };
+  };
+
+  function parseSize(text) {
+    const m = /^(\d+(?:[.,]\d+)?)\s*([kmgt])i?[bo]$/i.exec(String(text || '').trim());
+    if (!m) return null;
+    const unit = { k: 1 / 1048576, m: 1 / 1024, g: 1, t: 1024 }[m[2].toLowerCase()];
+    return parseFloat(m[1].replace(',', '.')) * unit;
+  }
+
+  // Null unless a resolution or a source is recognised: music and other non-video torrents get no score.
+  function parseRelease(text) {
+    const f = flat(text);
+    const res = firstOf(f, RESOLUTIONS);
+    const src = firstOf(f, SOURCES);
+    if (!res && !src) return null;
+    const hdrHits = matches(f, HDRS);
+    return {
+      lang: firstOf(f, LANGS),
+      res,
+      src,
+      hdr: hdrHits.length
+        ? { label: hdrHits.map((h) => h[2]).join('.'), pts: Math.max(...hdrHits.map((h) => h[1])) } : null,
+      audio: bestOf(f, AUDIOS),
+      codec: bestOf(f, CODECS)
+    };
+  }
+
+  const GROUP_LABEL = /^(?:pure|hcopt|opti|compat)-/i;
+
+  // The cells of one row (versions list or results grid), as texts. `hints.seeders` comes from the caller.
+  function parseCells(texts, hints) {
+    let sizeGB = null;
+    const rest = [];
+    for (const text of texts) {
+      const size = parseSize(text);
+      if (size !== null) { if (sizeGB === null) sizeGB = size; continue; }
+      if (text !== '·' && !GROUP_LABEL.test(text)) rest.push(text);
+    }
+    const release = parseRelease(rest.join(' '));
+    if (!release) return null;
+    const seeders = hints && typeof hints.seeders === 'number' ? hints.seeders : null;
+    return { release, sizeGB, seeders };
+  }
+
+  const TECH_TOKEN = new RegExp('^(?:multi|vff|vof|truefrench|vf2|vfi|vfq|vf|french|vostfr|subfrench|vost|vo'
+    + '|2160p|1080[pi]|720p|(?:576|480|360)[pi]|4k|uhd|remux|bdmv|4klight|hdlight|bluray|blu|bdrip|brrip|bd'
+    + '|web|webdl|webrip|hdtv|dvdrip|cam|ts|tc|av1|x265|h265|hevc|x264|h264|avc|xvid|divx'
+    + '|dv|dovi|hdr|hdr10|hdr10plus|hlg|sdr)$');
+  const SEASON_TOKEN = /^s\d{1,2}(?:e\d{1,3})*$/;
+  const YEAR_TOKEN = /^(?:19|20)\d\d$/;
+
+  // Identifies the film (or the season) a release name is about, so that only its own versions are compared.
+  function titleKey(name) {
+    const tokens = flat(name).split('.').filter(Boolean);
+    const cut = tokens.findIndex((t) => TECH_TOKEN.test(t) || SEASON_TOKEN.test(t));
+    const region = cut === -1 ? tokens : tokens.slice(0, cut);
+    if (!region.length) return '';
+    const season = tokens.find((t) => SEASON_TOKEN.test(t));
+    if (season) {
+      if (region.length > 1 && YEAR_TOKEN.test(region[region.length - 1])) region.pop();
+      return region.join('') + season;
+    }
+    for (let i = region.length - 1; i > 0; i--) if (YEAR_TOKEN.test(region[i])) return region.slice(0, i + 1).join('');
+    return region.join('');
+  }
+
+  function qualityFraction(r) {
+    let got = r.hdr ? r.hdr.pts : 0;
+    let max = QUALITY_MAX.hdr;
+    for (const k of ['res', 'src', 'audio', 'codec']) {
+      if (r[k]) { got += r[k].pts; max += QUALITY_MAX[k]; }
+    }
+    return got / max;
+  }
+
+  const langPoints = (r) => (r.lang ? r.lang.pts : LANG_UNKNOWN);
+
+  function median(values) {
+    const s = values.slice().sort((a, b) => a - b);
+    const mid = s.length >> 1;
+    return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  }
+
+  const AWARDS = {
+    best: { glyph: '★', label: 'Meilleur choix', color: '#facc15' },
+    value: { glyph: '⚖\uFE0E', label: 'Meilleur rapport qualité/taille', color: '#60a5fa' },
+    quality: { glyph: '◆', label: 'Meilleure qualité', color: '#c084fc' },
+    seeds: { glyph: '⚡\uFE0E', label: 'Plus de seeders', color: '#4ade80' }
+  };
+
+  const bandColor = (score) => (score >= 80 ? '#22c55e' : score >= 65 ? '#84cc16' : score >= 50 ? '#f59e0b' : '#ef4444');
+
+  // Scores the torrents of one film against each other. entries: [{ release, sizeGB, seeders }] (null = unknown).
+  // Seeders and sizes only count when they are known for every entry, so that the scores stay comparable.
+  function scoreGroup(entries) {
+    const n = entries.length;
+    const known = (v) => typeof v === 'number' && isFinite(v);
+    const useHealth = n > 0 && entries.every((e) => known(e.seeders));
+    const sized = n >= 2 && entries.every((e) => known(e.sizeGB) && e.sizeGB > 0);
+    const qualities = entries.map((e) => qualityFraction(e.release));
+    const ratios = sized
+      ? entries.map((e, i) => Math.pow(qualities[i], QUALITY_EXP) / Math.pow(e.sizeGB, SIZE_EXP)) : [];
+    const mid = sized ? median(ratios) : 0;
+    const useSize = sized && mid > 0;
+
+    const weights = { lang: WEIGHTS.lang, quality: WEIGHTS.quality };
+    if (useHealth) weights.health = WEIGHTS.health;
+    if (useSize) weights.size = WEIGHTS.size;
+    const total = Object.keys(weights).reduce((t, k) => t + weights[k], 0);
+    const max = {};
+    for (const k of Object.keys(weights)) max[k] = 100 * weights[k] / total;
+
+    const rows = entries.map((e, i) => {
+      const frac = { lang: langPoints(e.release) / LANG_MAX, quality: qualities[i] };
+      if (useHealth) frac.health = Math.min(1, Math.log10(1 + Math.max(0, e.seeders)) / Math.log10(101));
+      if (useSize) frac.size = 0.5 + 0.5 * Math.tanh(Math.log(ratios[i] / mid) / Math.LN2);
+      const parts = {};
+      let sum = 0;
+      for (const k of Object.keys(frac)) { parts[k] = frac[k] * max[k]; sum += parts[k]; }
+      const dead = e.seeders === 0;
+      return {
+        score: Math.min(Math.round(sum), dead ? DEAD_CAP : 100),
+        parts,
+        dead,
+        lang: langPoints(e.release),
+        quality: qualities[i],
+        ratio: ratios[i] || 0,
+        awards: []
+      };
+    });
+
+    if (n >= 2) {
+      const by = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+      const seeds = (i) => (known(entries[i].seeders) ? entries[i].seeders : -1);
+      const size = (i) => (known(entries[i].sizeGB) && entries[i].sizeGB > 0 ? entries[i].sizeGB : Infinity);
+      const alive = rows.map((r, i) => i).filter((i) => !rows[i].dead);
+      const winner = (ids, cmp) => (ids.length ? ids.slice().sort((a, b) => cmp(a, b) || a - b)[0] : -1);
+      const give = (i, key) => { if (i >= 0) rows[i].awards.push(key); };
+
+      give(winner(alive, (a, b) => by(rows[b].score, rows[a].score) || by(seeds(b), seeds(a)) || by(size(a), size(b))), 'best');
+      if (useSize) {
+        const topLang = Math.max(...alive.map((i) => rows[i].lang));
+        const topQuality = Math.max(...alive.map((i) => rows[i].quality));
+        const candidates = alive.filter((i) => rows[i].lang >= 0.8 * topLang && rows[i].quality >= 0.85 * topQuality);
+        give(winner(candidates, (a, b) => by(rows[b].ratio, rows[a].ratio) || by(rows[b].score, rows[a].score) || by(size(a), size(b))), 'value');
+      }
+      give(winner(alive, (a, b) => by(rows[b].quality, rows[a].quality) || by(rows[b].lang, rows[a].lang)
+        || by(seeds(b), seeds(a)) || by(size(a), size(b))), 'quality');
+      if (useHealth) {
+        const top = Math.max(...alive.map(seeds));
+        const leaders = alive.filter((i) => seeds(i) === top);
+        if (top > 0 && leaders.length === 1) give(leaders[0], 'seeds');
+      }
+    }
+    return { rows, useHealth, useSize, max };
+  }
+
+  const describe = (r) => ['lang', 'res', 'src', 'hdr', 'audio', 'codec'].map((k) => r[k] && r[k].label).filter(Boolean).join(' · ');
+
+  // Multi-line French text: shown as the tooltip of a badge and in the toast of its click.
+  function explain(entry, row, group) {
+    const names = { lang: 'Langue', quality: 'Qualité', size: 'Qualité/taille', health: 'Seeders' };
+    const lines = [`Score ${row.score}/100`];
+    for (const k of row.awards) lines.push(`${AWARDS[k].glyph} ${AWARDS[k].label}`);
+    lines.push(['lang', 'quality', 'size', 'health'].filter((k) => row.parts[k] !== undefined)
+      .map((k) => `${names[k]} ${Math.round(100 * row.parts[k] / group.max[k])} %`).join(' · '));
+    lines.push(describe(entry.release));
+    if (row.dead) lines.push(`0 seeder : score plafonné à ${DEAD_CAP}, jamais recommandé.`);
+    else if (typeof entry.seeders !== 'number') lines.push('Seeders inconnus : non comptés.');
+    else if (!group.useHealth) lines.push(`Seeders : ${entry.seeders} (non comptés : inconnus pour les autres versions).`);
+    return lines.join('\n');
+  }
+  // ==== scoring:end ====
+
+  // ---------- Scoring badges: torrent page and lists ----------
+
+  const GLYPH_ORDER = ['best', 'value', 'quality', 'seeds'];
+  const MAX_GLYPHS = 2;
+  const chipSig = new WeakMap();
+
+  const isOurs = (el) => el.hasAttribute(SCORE) || el.hasAttribute(PILL) || el.hasAttribute(MARK);
+  const toInt = (text) => (/^\d+(?:[\s\u00a0\u202f.,]\d{3})*$/.test(text) ? Number(text.replace(/\D+/g, '')) : null);
+  const hashOf = (a) => {
+    const m = /\/torrents\/([a-f0-9]{40})\b/i.exec(a.getAttribute('href') || '');
+    return m ? m[1].toLowerCase() : '';
+  };
+
+  // A team named like a release tag ("TS", "BD"...) must not change how its row reads.
+  const isTeamLink = (el) => el.tagName === 'A' && /\/community\/teams\//.test(el.getAttribute('href') || '');
+
+  // The elements holding text of their own (the cells of a row) with that text. Our injections are skipped.
+  function cellsOf(root) {
+    const out = [];
+    (function walk(el) {
+      for (const c of el.children) {
+        if (isOurs(c) || isTeamLink(c) || /^(?:svg|script|style)$/i.test(c.tagName)) continue;
+        let own = '';
+        for (const n of c.childNodes) if (n.nodeType === 3) own += n.nodeValue;
+        own = own.replace(/\s+/g, ' ').trim();
+        if (own) out.push({ el: c, text: own });
+        walk(c);
+      }
+    })(root);
+    return out;
+  }
+
+  // The seeders of a results row are its one green number.
+  function listHints(cells) {
+    const green = cells.filter((c) => /text-green/.test(String(c.el.className)) && toInt(c.text) !== null);
+    return { seeders: green.length === 1 ? toInt(green[0].text) : null };
+  }
+
+  function styled(text, css) {
+    const el = document.createElement('span');
+    el.textContent = text;
+    Object.assign(el.style, css);
+    return el;
+  }
+
+  function newChip(kind) {
+    const chip = document.createElement('span');
+    chip.setAttribute(SCORE, kind);
+    Object.assign(chip.style, {
+      display: 'inline-flex', alignItems: 'center', gap: '3px', padding: '1px 7px', borderRadius: '999px',
+      font: '600 11px/1.5 system-ui, sans-serif', whiteSpace: 'nowrap', flexShrink: '0', cursor: 'pointer'
+    });
+    if (kind === 'cell') Object.assign(chip.style, { justifySelf: 'center', alignSelf: 'center' });
+    chip.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toast(chip.title, false, true);
+    });
+    return chip;
+  }
+
+  // Looks like the stats cards of the torrent page: their classes are copied.
+  function newCard(sample) {
+    const card = document.createElement(sample.tagName.toLowerCase());
+    card.className = sample.className;
+    card.setAttribute(SCORE, 'page');
+    card.style.cursor = 'pointer';
+    card.addEventListener('click', () => toast(card.title, false, true));
+    return card;
+  }
+
+  // True when the element already shows this content: it is then left alone, so no mutation is triggered.
+  function unchanged(el, sig) {
+    if (chipSig.get(el) === sig) return true;
+    chipSig.set(el, sig);
+    return false;
+  }
+
+  const awardsOf = (scored) => GLYPH_ORDER.filter((k) => scored.awards.indexOf(k) !== -1);
+
+  function paintChip(chip, entry, scored, group) {
+    const glyphs = awardsOf(scored).slice(0, MAX_GLYPHS);
+    const tip = explain(entry, scored, group);
+    if (unchanged(chip, [scored.score, glyphs.join(), tip].join('|'))) return;
+    const color = bandColor(scored.score);
+    chip.title = tip;
+    Object.assign(chip.style, { background: color + '26', color, border: `1px solid ${color}66` });
+    chip.replaceChildren(String(scored.score), ...glyphs.map((k) => styled(AWARDS[k].glyph, { color: AWARDS[k].color })));
+  }
+
+  function paintCard(card, entry, scored, group) {
+    const awards = awardsOf(scored);
+    const tip = explain(entry, scored, group);
+    if (unchanged(card, [scored.score, awards.join(), tip].join('|'))) return;
+    const dim = { fontSize: '12px', opacity: '.65' };
+    card.title = tip;
+    card.replaceChildren(
+      styled('Score', dim),
+      styled(String(scored.score), { fontSize: '14px', fontWeight: '700', color: bandColor(scored.score) }),
+      styled('/100', dim),
+      ...awards.map((k) => styled(`${AWARDS[k].glyph} ${AWARDS[k].label}`,
+        { fontSize: '12px', fontWeight: '600', color: AWARDS[k].color, whiteSpace: 'nowrap' }))
+    );
+  }
+
+  // The stats cards under the torrent title (size, seeders, ...). Null when they can't be found.
+  function pageStats() {
+    const label = [...document.querySelectorAll('span')].find((s) => !s.children.length && /^seeders?$/i.test(norm(s))
+      && !!s.previousElementSibling && toInt(norm(s.previousElementSibling)) !== null);
+    const sample = label && label.parentElement;
+    const box = sample && sample.parentElement;
+    if (!box) return null;
+    let sizeGB = null;
+    for (const card of box.children) {
+      const size = isOurs(card) ? null : parseSize(norm(card));
+      if (size !== null) { sizeGB = size; break; }
+    }
+    return { seeders: toInt(norm(label.previousElementSibling)), sizeGB, box, sample };
+  }
+
+  // The children of the container linking to the most torrents that read as releases:
+  // [{ el, entry, cells, hash }]. hash is empty for the row of the torrent being viewed (it is no link).
+  function linkedRows(scope) {
+    const parents = new Set();
+    for (const a of scope.querySelectorAll('a[href*="/torrents/"]')) if (hashOf(a) && a.parentElement) parents.add(a.parentElement);
+    let best = [];
+    for (const parent of parents) {
+      const rows = [];
+      for (const el of parent.children) {
+        const hash = el.tagName === 'A' ? hashOf(el) : '';
+        if (isOurs(el) || (!hash && el.tagName !== 'DIV') || el.querySelector('[class*="grid-cols-["]')) continue;
+        const cells = cellsOf(el);
+        const entry = cells.length >= 5 ? parseCells(cells.map((c) => c.text), null) : null;
+        if (entry && entry.sizeGB > 0) rows.push({ el, entry, cells, hash });
+      }
+      if (rows.length > best.length) best = rows;
+    }
+    return best;
+  }
+
+  // "Versions (+33)": the other releases of the film, listed on its page.
+  function versionRows() {
+    const toggle = [...document.querySelectorAll('button')].find((b) => /^Versions\b/.test(norm(b)));
+    let scope = toggle ? toggle.parentElement : null;
+    for (let depth = 0; scope && depth < 3; depth++, scope = scope.parentElement) {
+      const rows = linkedRows(scope);
+      if (rows.length) return rows;
+    }
+    return [];
+  }
+
+  function paintVersion(row, entry, scored, group, live) {
+    const sizeCell = row.cells.find((c) => parseSize(c.text) !== null);
+    if (!sizeCell) return;
+    let chip = row.el.querySelector(`[${SCORE}]`);
+    if (!chip) chip = newChip('row');
+    if (chip.nextElementSibling !== sizeCell.el) sizeCell.el.insertAdjacentElement('beforebegin', chip);
+    paintChip(chip, entry, scored, group);
+    live.add(chip);
+  }
+
+  // The card goes with the stats of the torrent, else it follows the qBittorrent button.
+  function paintPage(stats, entry, scored, group, live) {
+    const kind = stats ? 'page' : 'page-inline';
+    let el = document.querySelector(`[${SCORE}^="page"]`);
+    if (el && el.getAttribute(SCORE) !== kind) { el.remove(); el = null; }
+    if (stats) {
+      if (!el) el = newCard(stats.sample);
+      if (stats.box.lastElementChild !== el) stats.box.append(el);
+      paintCard(el, entry, scored, group);
+    } else {
+      const after = badge && badge.isConnected ? badge : document.querySelector(`button[${MARK}="ours"]`);
+      if (!after) return;
+      if (!el) el = newChip(kind);
+      if (after.nextElementSibling !== el) after.insertAdjacentElement('afterend', el);
+      paintChip(el, entry, scored, group);
+    }
+    live.add(el);
+  }
+
+  function scorePage(live) {
+    const h1 = document.querySelector('h1');
+    const release = h1 ? parseRelease(h1.textContent) : null;
+    const stats = pageStats();
+    const rows = versionRows();
+    const pageHash = pageHashFromUrl();
+    let at = rows.findIndex((r) => r.hash === pageHash);
+    if (at < 0) at = rows.findIndex((r) => !r.hash);
+    if (!release && at < 0) return;
+    const seeders = stats ? stats.seeders : null;
+    const entries = rows.map((r) => r.entry);
+    if (at >= 0) entries[at] = Object.assign({}, entries[at], { seeders });
+    else { entries.push({ release, sizeGB: stats ? stats.sizeGB : null, seeders }); at = entries.length - 1; }
+    const group = scoreGroup(entries);
+    rows.forEach((r, i) => paintVersion(r, entries[i], group.rows[i], group, live));
+    paintPage(stats, entries[at], group.rows[at], group, live);
+  }
+
+  // Adds the score column of a results grid. False when its template can't take one.
+  function addScoreColumn(token) {
+    if (!scoredGrids.has(token)) {
+      scoredGrids.add(token);
+      applyGridRules();
+    }
+    return !!gridRule(token);
+  }
+
+  // The release name an item shows outside of its columns: it tells which film the row is about.
+  function releaseName(link, row) {
+    const names = [link.title, link.getAttribute('aria-label')]
+      .concat(cellsOf(link).filter((c) => !row.contains(c.el)).map((c) => c.text));
+    return names.find((t) => t && parseRelease(t) && titleKey(t)) || '';
+  }
+
+  function paintListItem(item, scored, group, live) {
+    if (addScoreColumn(item.token)) {
+      let chip = [...item.el.children].find((c) => c.hasAttribute(SCORE));
+      if (!chip) chip = newChip('cell');
+      if (item.el.lastElementChild !== chip) item.el.append(chip);
+      paintChip(chip, item.entry, scored, group);
+      live.add(chip);
+    }
+    // Small screens show another layout of the same item: the badge goes next to its own copy button.
+    const slot = item.link && pillSlots(item.link).find((s) => s.where === 'beforebegin' && !item.el.contains(s.ref));
+    if (!slot) return;
+    let prev = slot.ref.previousElementSibling;
+    while (prev && prev.hasAttribute(PILL)) prev = prev.previousElementSibling;
+    const chip = prev && prev.hasAttribute(SCORE) ? prev : newChip('card');
+    if (chip !== prev) slot.ref.insertAdjacentElement('beforebegin', chip);
+    paintChip(chip, item.entry, scored, group);
+    live.add(chip);
+  }
+
+  // Results grids (search, categories): the rows of one film are compared, the others get a score alone.
+  function scoreLists(live) {
+    const groups = new Map();
+    const batches = [];
+    for (const el of document.querySelectorAll('[class*="grid-cols-["]')) {
+      const token = gridToken(el);
+      if (!token || el.querySelector('h1')) continue;
+      const tracks = token.slice('lg:grid-cols-['.length, -1).split('_').length;
+      if ([...el.children].filter((c) => !c.hasAttribute(SCORE)).length !== tracks) continue;
+      const cells = cellsOf(el);
+      const entry = parseCells(cells.map((c) => c.text), listHints(cells));
+      if (!entry || !(entry.sizeGB > 0)) continue;
+      const link = rowLink(el);
+      const key = link ? titleKey(releaseName(link, el)) : '';
+      const item = { el, token, entry, link };
+      if (!key) batches.push([item]);
+      else if (groups.has(key)) groups.get(key).push(item);
+      else groups.set(key, [item]);
+    }
+    for (const items of [...groups.values(), ...batches]) {
+      const group = scoreGroup(items.map((i) => i.entry));
+      items.forEach((item, i) => paintListItem(item, group.rows[i], group, live));
+    }
+  }
+
+  function refreshScores() {
+    try {
+      const live = new Set();
+      if (pageHashFromUrl()) scorePage(live);
+      scoreLists(live);
+      for (const el of document.querySelectorAll(`[${SCORE}]`)) if (!live.has(el)) el.remove();
+    } catch (e) {
+      console.warn('Arr411 : badges de score indisponibles', e);
+    }
+  }
+
   let refreshTimer = null;
-  const isOwn = (n) => n.nodeType === 1 && (n.hasAttribute(PILL) || n.hasAttribute(MARK));
+  const isOwn = (n) => n.nodeType === 1 && (n.hasAttribute(PILL) || n.hasAttribute(MARK) || n.hasAttribute(SCORE));
   // The removal of one of our buttons (e.g. by a Vue re-render) is a page change: it must be put back.
   const isOwnButton = (n) => n.nodeType === 1 && n.tagName === 'BUTTON' && n.hasAttribute(MARK);
   const isOwnMutation = (m) => (badge && badge.contains(m.target)) || isOwn(m.target)
@@ -751,11 +1292,12 @@
       if (mutations.every(isOwnMutation)) return;
       inject();
       clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(() => { refreshStatus(); refreshListBadges(); }, 600);
+      refreshTimer = setTimeout(() => { refreshStatus(); refreshListBadges(); refreshScores(); }, 600);
     }).observe(document.documentElement, { childList: true, subtree: true });
     setInterval(() => { if (!document.hidden) refreshListBadges(); }, 30000);
     inject();
     refreshStatus();
     refreshListBadges();
+    refreshScores();
   });
 })();

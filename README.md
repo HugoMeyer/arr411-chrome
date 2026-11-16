@@ -45,6 +45,12 @@
 - **Status badge** on torrent pages showing qBittorrent progress and whether the title is already in Radarr, Sonarr or Lidarr.
 - **List badges** (`✔ qBit` / `⇩ 42 %`) on search results and notifications for torrents you already have.
 
+### Choosing the right version
+- **Score badge** (0 to 100) on every version listed under *Versions* on a torrent page, on the torrent itself, and on result rows. It weighs the language (MULTI.VFF first), the quality (resolution, source, HDR, audio, codec), the seeders and the size.
+- **Awards** for the best of the list: ★ best choice, ⚖︎ best quality for the size, ◆ best quality, ⚡︎ most seeders. A torrent with no seeders can't win and scores 35 at most.
+- Click a badge for the detail. Only versions of the same title are compared.
+- The *Versions* list doesn't show seeders, so its versions are compared on language, quality and size. Result rows also count seeders.
+
 ### Toolbar popup and notifications
 - **Popup** listing active and recently completed torrents, with pause and resume.
 - **Desktop notifications** when a download completes.
@@ -152,8 +158,9 @@ After editing files, click **↻** on the extension in `chrome://extensions`, th
 ```
 manifest.json   MV3 manifest
 background.js   Service worker: qBittorrent and *arr APIs, download interception, notifications
-content.js      C411 integration: buttons, dialog, badges
+content.js      C411 integration: buttons, dialog, badges, version scoring
 page-hook.js    Main-world hook that keeps blob URLs alive long enough to fetch them
+test/           Unit tests of the scoring (run with: node --test)
 options.html/js Settings page
 popup.html/js   Toolbar popup (torrent list, pause and resume)
 icon*.png       Icons
