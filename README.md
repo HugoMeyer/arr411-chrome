@@ -53,7 +53,8 @@
 
 ### Toolbar popup and notifications
 - **Popup** listing active and recently completed torrents, with pause and resume.
-- **Desktop notifications** when a download completes.
+- **Desktop notifications** when a download completes. At most three are shown at once for a burst of completions; the rest is summed up in one notification. Torrents tagged `zen-farm` never notify.
+- **Large libraries.** The extension never downloads your whole qBittorrent list: the poll asks only for the downloads in progress, then for the finished ones by hash. The popup asks for what is downloading and the last 20 completions. The list badges read the newest 500 torrents (the `zen-farm` ones left out, tag by tag when the library is bigger than that) and look up the torrents of the page by hash. With tens of thousands of torrents this is the difference between a few kB and tens of MB every 30 seconds.
 
 ---
 
@@ -160,7 +161,7 @@ manifest.json   MV3 manifest
 background.js   Service worker: qBittorrent and *arr APIs, download interception, notifications
 content.js      C411 integration: buttons, dialog, badges, version scoring
 page-hook.js    Main-world hook that keeps blob URLs alive long enough to fetch them
-test/           Unit tests of the scoring (run with: node --test)
+test/           Unit tests of the scoring and of the background engine (run with: node --test)
 options.html/js Settings page
 popup.html/js   Toolbar popup (torrent list, pause and resume)
 icon*.png       Icons

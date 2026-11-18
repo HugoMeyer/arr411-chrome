@@ -645,12 +645,26 @@
   const normName = (s) => (s || '').toLowerCase().replace(/\.torrent$/, '').replace(/[^a-z0-9]+/g, '');
   let qbIndex = null; // { byName: Map, byHash: Map, at }
 
+  // The torrents of the page, by hash: a library too big to be listed whole is asked about them directly.
+  function pageHashes() {
+    const found = new Set();
+    for (const a of document.querySelectorAll('a[href]')) {
+      const m = (a.getAttribute('href') || '').match(/[a-f0-9]{40}/i);
+      if (m) found.add(m[0].toLowerCase());
+      if (found.size >= 300) break;
+    }
+    return [...found];
+  }
+
   async function loadIndex() {
-    if (qbIndex && Date.now() - qbIndex.at < 30000) return qbIndex;
-    const res = await send({ type: 'qbitIndex' });
+    const hashes = pageHashes();
+    const age = qbIndex ? Date.now() - qbIndex.at : Infinity;
+    if (qbIndex && age < 30000 && (age < 3000 || hashes.every((h) => qbIndex.asked.has(h)))) return qbIndex;
+    const res = await send({ type: 'qbitIndex', hashes });
     const torrents = res.ok ? res.torrents : [];
     qbIndex = {
       at: Date.now(),
+      asked: new Set(hashes),
       byName: new Map(torrents.map((t) => [normName(t.name), t])),
       byHash: new Map(torrents.map((t) => [t.hash, t]))
     };

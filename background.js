@@ -86,6 +86,7 @@ async function addTorrent({ base64, filename, category, paused }) {
   const text = (await res.text()).trim();
   if (!res.ok || text === 'Fails.') throw new Error(`qBittorrent a refusé le torrent (${res.status} ${text})`);
   await chrome.storage.local.set({ lastCategory: category || '' });
+  indexCache = null; // the list badges must see the torrent that was just added
   const hash = await infoHash(bytes).catch(() => null);
   if (hash) await trackTorrent(hash, filename);
   return hash;
@@ -123,6 +124,67 @@ async function infoHash(bytes) {
   return null;
 }
 
+// ---------- Large libraries ----------
+
+// A ratio farm can hold tens of thousands of torrents: listing them all is tens of MB per request, many times an hour.
+// What runs in the background therefore asks qBittorrent only for what it needs.
+const QUIET_TAGS = ['zen-farm']; // never notified, and left out of the lists that cannot be fetched whole
+const HASH_CHUNK = 40;           // hashes per request: keeps the URL short
+const LIST_LIMIT = 500;          // torrents asked per request when listing
+const POPUP_DONE = 20;           // completed torrents shown by the popup
+const INDEX_TTL_MS = 30000;      // how long the list badges reuse a listing
+const NOTIFY_MAX = 3;            // completions shown one by one per poll; the rest is summed up in one notification
+
+const isQuietTag = (tag) => QUIET_TAGS.includes(String(tag).trim().toLowerCase());
+const isQuiet = (t) => (t.tags || '').split(',').some(isQuietTag);
+
+async function qbJson(path) {
+  const res = await qbFetch(path);
+  if (!res.ok) throw new Error(`qBittorrent ${res.status}`);
+  return res.json();
+}
+
+async function torrentsByHash(hashes) {
+  const found = [];
+  for (let i = 0; i < hashes.length; i += HASH_CHUNK) {
+    found.push(...await qbJson('/api/v2/torrents/info?hashes=' + hashes.slice(i, i + HASH_CHUNK).join('|')));
+  }
+  return found;
+}
+
+// `query` (a filter and a sort), asked tag by tag with the quiet tags left out: what a farm hides at the top of a plain listing is found
+// this way. `tag=` alone means "without tag".
+async function listByTag(query, limit) {
+  const tags = (await qbJson('/api/v2/torrents/tags')).filter((tag) => !isQuietTag(tag));
+  const byHash = new Map();
+  for (const tag of ['', ...tags]) {
+    for (const t of await qbJson(`/api/v2/torrents/info?tag=${encodeURIComponent(tag)}&${query}&limit=${limit}`)) {
+      if (!isQuiet(t)) byHash.set(t.hash, t);
+    }
+  }
+  return [...byHash.values()];
+}
+
+// The newest torrents of the library, most recent first. `complete` tells that the library fits in `limit` and nothing is missing;
+// otherwise it is listed through its tags, the quiet ones left out.
+async function listLibrary(limit = LIST_LIMIT) {
+  const query = 'sort=added_on&reverse=true';
+  const first = await qbJson(`/api/v2/torrents/info?${query}&limit=${limit}`);
+  if (first.length < limit) return { torrents: first, complete: true };
+  return { torrents: (await listByTag(query, limit)).sort((a, b) => b.added_on - a.added_on), complete: false };
+}
+
+// The latest completions, most recent first, the quiet ones left out. A farm completes in bulk, so the newest ones can all be quiet:
+// the tags are asked one by one in that case only.
+async function latestCompleted(count) {
+  const query = 'filter=completed&sort=completion_on&reverse=true';
+  const probe = count * 3;
+  const first = await qbJson(`/api/v2/torrents/info?${query}&limit=${probe}`);
+  const kept = first.filter((t) => !isQuiet(t));
+  const found = kept.length >= count || first.length < probe ? kept : await listByTag(query, count);
+  return found.sort((a, b) => b.completion_on - a.completion_on).slice(0, count);
+}
+
 // ---------- Completion notifications ----------
 
 async function trackTorrent(hash, name) {
@@ -139,15 +201,23 @@ async function pollCompletions() {
   const hashes = Object.keys(tracked);
   if (!cfg.notifyAll && !hashes.length) return;
 
-  const res = await qbFetch(cfg.notifyAll ? '/api/v2/torrents/info' : `/api/v2/torrents/info?hashes=${hashes.join('|')}`);
-  if (!res.ok) return;
-  const list = await res.json();
+  // Never the whole library (ratio farms hold tens of thousands of torrents): the torrents still downloading are listed, then the ones
+  // that left that list since the last poll are looked up by hash.
+  const downloading = cfg.notifyAll ? (await qbJson('/api/v2/torrents/info?filter=downloading')).map((t) => t.hash) : [];
+  const inProgress = new Set(downloading);
+  const left = incomplete.filter((h) => !inProgress.has(h));
+  const list = await torrentsByHash([...new Set([...hashes, ...left])]);
   const seen = new Set(list.map((t) => t.hash));
+  let shown = 0;
+  let more = 0;
 
   for (const t of list) {
     if (t.progress < 1) continue;
     const wasWatched = tracked[t.hash] || (cfg.notifyAll && incomplete.includes(t.hash));
     if (!wasWatched) continue;
+    if (isQuiet(t)) { delete tracked[t.hash]; continue; }
+    if (shown >= NOTIFY_MAX) { more++; delete tracked[t.hash]; continue; }
+    shown++;
     chrome.notifications.create('done:' + t.hash, {
       type: 'basic',
       iconUrl: 'icon128.png',
@@ -157,12 +227,22 @@ async function pollCompletions() {
     });
     delete tracked[t.hash];
   }
+  if (more) {
+    chrome.notifications.create('done:more', {
+      type: 'basic',
+      iconUrl: 'icon128.png',
+      title: 'Téléchargements terminés',
+      message: `+ ${more} autre${more > 1 ? 's' : ''} téléchargement${more > 1 ? 's' : ''} terminé${more > 1 ? 's' : ''}`,
+      contextMessage: 'qBittorrent'
+    });
+  }
   // Forget tracked torrents removed from qBittorrent.
   for (const h of hashes) {
     if (tracked[h] && !seen.has(h) && Date.now() - tracked[h].added > 10 * 60000) delete tracked[h];
   }
   await chrome.storage.local.set({ tracked });
-  await chrome.storage.session.set({ incomplete: list.filter((t) => t.progress < 1).map((t) => t.hash) });
+  if (cfg.notifyAll) await chrome.storage.session.set({ incomplete: downloading });
+  else if (incomplete.length) await chrome.storage.session.set({ incomplete: [] });
 }
 
 function ensureAlarm() {
@@ -180,18 +260,36 @@ chrome.notifications.onClicked.addListener(async (id) => {
 
 // ---------- Popup / list badges ----------
 
+// What the popup shows: everything in progress (paused and queued included), and the latest completions.
 async function listTorrents() {
-  const [tRes, iRes] = await Promise.all([
-    qbFetch('/api/v2/torrents/info?sort=added_on&reverse=true'),
+  const [active, completed, iRes] = await Promise.all([
+    qbJson('/api/v2/torrents/info?filter=downloading&sort=added_on&reverse=true'),
+    latestCompleted(POPUP_DONE),
     qbFetch('/api/v2/transfer/info')
   ]);
-  if (!tRes.ok) throw new Error(`qBittorrent ${tRes.status}`);
-  const torrents = (await tRes.json()).map((t) => ({
+  const torrents = [...active.filter((t) => !isQuiet(t)), ...completed].map((t) => ({
     hash: t.hash, name: t.name, state: t.state, progress: t.progress, dlspeed: t.dlspeed, upspeed: t.upspeed,
     eta: t.eta, size: t.size, category: t.category, ratio: t.ratio, completion_on: t.completion_on, added_on: t.added_on
   }));
   const info = iRes.ok ? await iRes.json() : {};
   return { torrents, dlspeed: info.dl_info_speed || 0, upspeed: info.up_info_speed || 0 };
+}
+
+// What the list badges of a C411 page are matched against: the library (shared by the pages for a moment), plus the torrents of the page
+// that a partial listing left out, found by hash.
+let indexCache = null; // { at, torrents: Map, complete }
+
+async function badgeIndex(wanted) {
+  if (!indexCache || Date.now() - indexCache.at > INDEX_TTL_MS) {
+    const { torrents, complete } = await listLibrary();
+    indexCache = { at: Date.now(), torrents: new Map(torrents.map((t) => [t.hash, t])), complete };
+  }
+  const index = new Map(indexCache.torrents);
+  if (!indexCache.complete) {
+    const missing = (wanted || []).filter((h) => /^[a-f0-9]{40}$/.test(h) && !index.has(h)).slice(0, 300);
+    for (const t of await torrentsByHash(missing)) index.set(t.hash, t);
+  }
+  return [...index.values()].map(({ hash, name, progress, state }) => ({ hash, name, progress, state }));
 }
 
 // qBittorrent 5 renamed pause/resume to stop/start.
@@ -605,8 +703,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'qbitIndex': {
         const cfg = await getConfig();
         if (!cfg.listBadges) return { torrents: [] };
-        const { torrents } = await listTorrents();
-        return { torrents: torrents.map(({ hash, name, progress, state }) => ({ hash, name, progress, state })) };
+        return { torrents: await badgeIndex(msg.hashes) };
       }
       case 'toggleTorrent':
         await toggleTorrent(msg.hash, msg.pause);
