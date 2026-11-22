@@ -29,6 +29,7 @@
 - **qBittorrent button in result lists**, at the end of each row, after the download icon. Columns stay aligned.
 - **Category picker** before every send. It lists your qBittorrent categories and remembers the last one you used.
 - **Add paused** option.
+- **Free disk space.** The dialog shows what is left on the disk of the category you pick (qBittorrent 5.3 or later) and warns you, without blocking the send, when the torrent is bigger than that minus 1 GiB. The button then reads *Envoyer quand même*. With an older qBittorrent nothing is shown.
 - Handles C411's **"Téléchargement normal"** prompt automatically when it appears.
 
 ### Radarr / Sonarr / Lidarr integration
@@ -50,9 +51,21 @@
 - **Awards** for the best of the list: ★ best choice, ⚖︎ best quality for the size, ◆ best quality, ⚡︎ most seeders. A torrent with no seeders can't win and scores 35 at most.
 - Click a badge for the detail. Only versions of the same title are compared.
 - The *Versions* list doesn't show seeders, so its versions are compared on language, quality and size. Result rows also count seeders.
+- **Score profile.** *Options → Score des torrents* sets how the score weighs language, quality, seeders and size. The weights are relative: when the seeders aren't known, the other weights are rescaled. A change applies when you come back to the C411 tab.
+
+  | Profile | Language | Quality | Seeders | Size |
+  |---|---|---|---|---|
+  | *Équilibré (par défaut)* | 30 | 30 | 20 | 20 |
+  | *Qualité d’image* | 20 | 65 | 10 | 5 |
+  | *VF / MULTI d’abord* | 70 | 15 | 10 | 5 |
+  | *Petite taille* | 20 | 10 | 10 | 60 |
+  | *Ratio (seeders)* | 15 | 15 | 60 | 10 |
+
+  *Personnalisé* takes the four weights you type (0 to 100 each). On a torrent page the seeders of the other versions aren't shown, so *Ratio (seeders)* ranks that list like *Équilibré*; it makes a difference on result rows.
 
 ### Toolbar popup and notifications
 - **Popup** listing active and recently completed torrents, with pause and resume.
+- **Update notice.** At most every 12 hours the popup reads this repository's public `manifest.json` on GitHub (a plain request: no credential, no extra permission). If it holds a newer version, a banner says so and links to the repository. To update, pull the repository and click **↻** on the extension in `chrome://extensions`. If the check fails, nothing is shown.
 - **Desktop notifications** when a download completes. At most three are shown at once for a burst of completions; the rest is summed up in one notification. Torrents tagged `zen-farm` never notify.
 - **Large libraries.** The extension never downloads your whole qBittorrent list: the poll asks only for the downloads in progress, then for the finished ones by hash. The popup asks for what is downloading and the last 20 completions. The list badges read the newest 500 torrents (the `zen-farm` ones left out, tag by tag when the library is bigger than that) and look up the torrents of the page by hash. With tens of thousands of torrents this is the difference between a few kB and tens of MB every 30 seconds.
 
@@ -83,6 +96,7 @@ Right-click the extension icon and choose **Options**.
 | **Sonarr** *(optional)* | URL, API key, quality profile, default root folder, qBittorrent category → **Test** |
 | **Lidarr** *(optional)* | URL, API key, quality profile, metadata profile, default root folder, qBittorrent category (`lidarr` by default) → **Test** |
 | **Display** | List badges, completion notifications |
+| **Score des torrents** | Score profile and, for *Personnalisé*, the weights of language, quality, seeders and size (0 to 100) |
 
 - API keys are under **Settings → General → Security** in Radarr, Sonarr and Lidarr.
 - Lidarr's **metadata profile** decides which albums are listed for a newly added artist. The built-in `None` profile keeps only the albums you add from C411.
@@ -123,6 +137,7 @@ C411 page ──click──▶ content script ──"arm"──▶ service worke
 - The torrent infohash is computed locally (bencode + SHA-1) to track progress and send notifications.
 - For music, the public MusicBrainz API (no account needed) turns C411's release links or names into the album IDs Lidarr expects.
 - A `declarativeNetRequest` rule sets the `Origin` and `Referer` headers, so qBittorrent's CSRF protection accepts the requests.
+- The free space of the dialog comes from qBittorrent's `app/getFreeSpaceAtPath` (Web API 2.15.2, qBittorrent 5.3+), asked for the default save path and for the save path of each category: 10 lookups at most, in parallel, 1.5 s each at most. A qBittorrent that doesn't have it (404) is remembered for 10 minutes.
 
 ---
 
@@ -163,7 +178,7 @@ content.js      C411 integration: buttons, dialog, badges, version scoring
 page-hook.js    Main-world hook that keeps blob URLs alive long enough to fetch them
 test/           Unit tests of the scoring and of the background engine (run with: node --test)
 options.html/js Settings page
-popup.html/js   Toolbar popup (torrent list, pause and resume)
+popup.html/js   Toolbar popup (torrent list, pause and resume, update notice)
 icon*.png       Icons
 LISEZMOI.txt    Quick install guide, in French
 ```

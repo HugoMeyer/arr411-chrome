@@ -3,7 +3,8 @@ const DEFAULTS = {
   radarrUrl: '', radarrKey: '', radarrRoot: '', radarrProfile: '', radarrCategory: '',
   sonarrUrl: '', sonarrKey: '', sonarrRoot: '', sonarrProfile: '', sonarrCategory: '',
   lidarrUrl: '', lidarrKey: '', lidarrRoot: '', lidarrProfile: '', lidarrMetaProfile: '', lidarrCategory: 'lidarr',
-  notifyEnabled: true, notifyAll: false, listBadges: true
+  notifyEnabled: true, notifyAll: false, listBadges: true,
+  scorePreset: 'equilibre', scoreWeights: { lang: 30, quality: 30, health: 20, size: 20 }
 };
 const ARM_TIMEOUT_MS = 20000;
 let pending = null; // { tabId, category, paused, media, expires }
@@ -120,10 +121,71 @@ async function qbFetch(path, opts = {}, retry = true) {
   return res;
 }
 
-async function getCategories() {
+async function readCategories() {
   const res = await qbFetch('/api/v2/torrents/categories');
   if (!res.ok) throw new Error(`Impossible de lire les catégories (${res.status})`);
-  return Object.keys(await res.json()).sort((a, b) => a.localeCompare(b));
+  return res.json();
+}
+
+const categoryNames = (raw) => Object.keys(raw).sort((a, b) => a.localeCompare(b));
+
+// ---------- Free disk space ----------
+
+// qBittorrent ≥ 5.3 (Web API 2.15.2) tells the free space of a path; older versions answer 404 (or 400/405). The send dialog only
+// wants a hint: a failure leaves that path out, and sync/maindata (far too heavy with thousands of torrents) is never used.
+const SPACE_TIMEOUT_MS = 1500;
+const SPACE_MAX_PATHS = 10;
+const SPACE_RETRY_MS = 10 * 60 * 1000;
+const NO_SPACE_API = [400, 404, 405];
+let spaceUnsupported = null; // { url, until }: this server has no such endpoint, it is not asked again for a while
+
+const noSpaceApi = (url) => !!spaceUnsupported && spaceUnsupported.url === url && spaceUnsupported.until > Date.now();
+const spaceText = async (res) => (res.ok ? (await res.text()).trim() : '');
+// A relative category path is relative to the default save path: it has no free space of its own to look up.
+const absolutePath = (p) => (typeof p === 'string' && /^(?:[\\/]|[A-Za-z]:[\\/])/.test(p) ? p : '');
+
+// { defaultPath, byPath: { path: bytes }, categoryPaths: { category: path } } for the default save path and the save paths of the
+// categories (the one the dialog opens on first), or null when nothing is known. Never throws, and answers within timeoutMs.
+async function freeSpace(raw, cfg, timeoutMs = SPACE_TIMEOUT_MS) {
+  if (noSpaceApi(cfg.qbUrl)) return null;
+  const abort = new AbortController();
+  const opts = { signal: abort.signal };
+  let timer;
+  // The shims of the apps ignore the abort signal: the race is what bounds the wait.
+  const deadline = new Promise((resolve) => { timer = setTimeout(() => { abort.abort(); resolve(); }, timeoutMs); });
+
+  const known = new Map(); // path → free bytes
+  const asked = new Set();
+  const lookup = (path) => {
+    if (asked.has(path)) return Promise.resolve();
+    asked.add(path);
+    return qbFetch(`/api/v2/app/getFreeSpaceAtPath?path=${encodeURIComponent(path)}`, opts).then(async (res) => {
+      if (NO_SPACE_API.includes(res.status)) { spaceUnsupported = { url: cfg.qbUrl, until: Date.now() + SPACE_RETRY_MS }; return; }
+      const text = await spaceText(res);
+      if (/^\d+$/.test(text) && Number.isSafeInteger(Number(text))) known.set(path, Number(text)); // -1 means qBittorrent could not tell
+    }).catch(() => {});
+  };
+
+  const own = (name) => {
+    const info = Object.prototype.hasOwnProperty.call(raw, name) ? raw[name] : null;
+    return info ? absolutePath(info.savePath) : '';
+  };
+  // The most useful categories first, the default path always has its slot.
+  const wanted = [cfg.lastCategory || cfg.defaultCategory, cfg.radarrCategory, cfg.sonarrCategory, cfg.lidarrCategory, ...categoryNames(raw)];
+  const paths = [...new Set(wanted.map(own).filter(Boolean))].slice(0, SPACE_MAX_PATHS - 1);
+
+  let defaultPath = '';
+  const jobs = paths.map(lookup);
+  jobs.push(qbFetch('/api/v2/app/defaultSavePath', opts).then(spaceText).then((text) => {
+    defaultPath = absolutePath(text);
+    return defaultPath && lookup(defaultPath);
+  }).catch(() => {}));
+  await Promise.race([Promise.all(jobs), deadline]);
+  clearTimeout(timer);
+
+  if (noSpaceApi(cfg.qbUrl) || !known.size) return null;
+  const categoryPaths = Object.fromEntries(Object.keys(raw).map((name) => [name, own(name) || defaultPath]).filter(([, path]) => known.has(path)));
+  return { defaultPath, byPath: Object.fromEntries(known), categoryPaths };
 }
 
 async function addTorrent({ base64, filename, category, paused }) {
@@ -773,6 +835,38 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   });
 });
 
+// ---------- Score presets ----------
+
+// Weights of the parts of the torrent score that content.js computes (each preset adds up to 100). equilibre is the historical
+// score. qualite: a Remux/BDMV 2160p beats the compact encodes. vf: MULTI.VFF/VOF well ahead of VF2/VFQ/VOSTFR. leger: the size
+// part rewards the quality kept per GB. ratio: seeders first; a torrent page only knows its own seeders, so health is left out
+// there and ratio scores like equilibre. perso: the weights saved in the settings.
+const SCORE_KEYS = ['lang', 'quality', 'health', 'size'];
+const SCORE_PRESETS = {
+  equilibre: { lang: 30, quality: 30, health: 20, size: 20 },
+  qualite: { lang: 20, quality: 65, health: 10, size: 5 },
+  vf: { lang: 70, quality: 15, health: 10, size: 5 },
+  leger: { lang: 20, quality: 10, health: 10, size: 60 },
+  ratio: { lang: 15, quality: 15, health: 60, size: 10 }
+};
+
+function scoreWeight(v, fallback) {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN;
+  return Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : fallback;
+}
+
+// { preset, weights } the page scores with. What is unknown or unusable (unknown preset, perso weights all at 0) is equilibre.
+function scorePrefs(cfg) {
+  const id = cfg && typeof cfg.scorePreset === 'string' ? cfg.scorePreset : '';
+  if (Object.prototype.hasOwnProperty.call(SCORE_PRESETS, id)) return { preset: id, weights: { ...SCORE_PRESETS[id] } };
+  if (id === 'perso') {
+    const saved = isObject(cfg.scoreWeights) ? cfg.scoreWeights : {};
+    const weights = Object.fromEntries(SCORE_KEYS.map((k) => [k, scoreWeight(saved[k], SCORE_PRESETS.equilibre[k])]));
+    if (SCORE_KEYS.some((k) => weights[k] > 0)) return { preset: 'perso', weights };
+  }
+  return { preset: 'equilibre', weights: { ...SCORE_PRESETS.equilibre } };
+}
+
 // ---------- Messages from the page ----------
 
 // The C411 page is not trusted: what it asks of the engine is rebuilt here from validated fields only, never passed through as is.
@@ -920,6 +1014,10 @@ function cleanPageMessage(msg, sender) {
       if (isExtensionPage(sender) && isObject(msg.cfg)) out.cfg = msg.cfg;
       return out;
     }
+    case 'pagePrefs':
+      return { type: msg.type };
+    case 'getCategories':
+      return { type: msg.type, withSpace: pageFlag(msg.withSpace, 'espace disque') };
     default:
       return msg;
   }
@@ -932,9 +1030,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     switch (msg.type) {
       case 'getCategories': {
         const cfg = await getConfig();
-        const categories = await getCategories();
-        return {
-          categories,
+        const raw = await readCategories();
+        const out = {
+          categories: categoryNames(raw),
           selected: cfg.lastCategory || cfg.defaultCategory,
           byType: { movie: cfg.radarrCategory, series: cfg.sonarrCategory, music: cfg.lidarrCategory },
           defaultRoot: { movie: cfg.radarrRoot, series: cfg.sonarrRoot, music: cfg.lidarrRoot },
@@ -944,7 +1042,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             music: !!(cfg.lidarrUrl && cfg.lidarrKey)
           }
         };
+        if (msg.withSpace) out.space = await freeSpace(raw, cfg).catch(() => null); // a hint: it never fails the categories
+        return out;
       }
+      case 'pagePrefs':
+        return { score: scorePrefs(await getConfig()) };
       case 'pageStatus':
         return pageStatus(msg);
       case 'listTorrents':

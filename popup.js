@@ -88,13 +88,62 @@ for (const b of document.querySelectorAll('[data-tab]')) {
   };
 }
 $('options').onclick = () => chrome.runtime.openOptionsPage();
-$('open').onclick = async () => {
-  const { qbUrl = '' } = await chrome.storage.local.get('qbUrl');
+
+function openUrl(raw) {
   try {
-    const url = new URL(qbUrl);
+    const url = new URL(raw);
     if (['https:', 'http:', 'magnet:'].includes(url.protocol)) chrome.tabs.create({ url: url.href });
   } catch {}
+}
+$('open').onclick = async () => {
+  const { qbUrl = '' } = await chrome.storage.local.get('qbUrl');
+  openUrl(qbUrl);
 };
+
+// ---------- Update notice ----------
+// The extension is installed unpacked from GitHub: nothing else says that a newer version exists.
+
+// ==== version:begin ====
+const REPO_URL = 'https://github.com/HugoMeyer/arr411-chrome';
+const MANIFEST_URL = 'https://raw.githubusercontent.com/HugoMeyer/arr411-chrome/main/manifest.json';
+const UPDATE_CHECK_EVERY_MS = 12 * 60 * 60 * 1000;
+
+// True when the dotted version `a` is newer than `b` ("1.10.0" is newer than "1.9.2"). Anything that is
+// not digits separated by dots is never newer.
+function isNewer(a, b) {
+  const parts = (v) => (/^\d+(?:\.\d+)*$/.test(String(v)) ? String(v).split('.').map(Number) : null);
+  const x = parts(a);
+  const y = parts(b);
+  if (!x || !y) return false;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const diff = (x[i] || 0) - (y[i] || 0);
+    if (diff) return diff > 0;
+  }
+  return false;
+}
+
+// Silent on any error: no network, GitHub down, odd answer...
+async function checkUpdate() {
+  try {
+    const { updateCheck } = await chrome.storage.local.get('updateCheck');
+    let latest = updateCheck && typeof updateCheck.latest === 'string' ? updateCheck.latest : '';
+    const age = updateCheck && typeof updateCheck.at === 'number' ? Date.now() - updateCheck.at : Infinity;
+    if (!(age >= 0 && age < UPDATE_CHECK_EVERY_MS)) {
+      const res = await fetch(MANIFEST_URL);
+      if (!res.ok) return;
+      const { version } = await res.json();
+      if (typeof version !== 'string') return;
+      latest = version;
+      await chrome.storage.local.set({ updateCheck: { at: Date.now(), latest } });
+    }
+    if (!isNewer(latest, chrome.runtime.getManifest().version)) return;
+    $('updateText').textContent = `Nouvelle version ${latest} disponible`;
+    $('update').hidden = false;
+  } catch {}
+}
+// ==== version:end ====
+$('updateOpen').onclick = () => openUrl(REPO_URL);
 
 refresh();
 setInterval(refresh, 2000);
+checkUpdate();

@@ -24,10 +24,16 @@
     .error { color: #ff7b72; white-space: pre-wrap; }
     footer { display: flex; justify-content: space-between; padding: 8px 12px; border-top: 1px solid #333; }
     footer a { color: #60a5fa; text-decoration: none; cursor: pointer; }
+    .update { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px;
+              background: #1e3a5f; border-bottom: 1px solid #2f5d96; color: #cfe3ff; }
+    .update button { background: #3b82f6; border: 0; color: #fff; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+    .update button:hover { background: #2563eb; }
+    .update[hidden] { display: none; }
   </style>
 </head>
 <body>
   <header><b>qBittorrent</b><span class="speeds" id="speeds"></span></header>
+  <div class="update" id="update" hidden><span id="updateText"></span><button id="updateOpen">Voir sur GitHub</button></div>
   <div class="tabs">
     <button data-tab="active" class="on">En cours</button>
     <button data-tab="done">Terminés récents</button>

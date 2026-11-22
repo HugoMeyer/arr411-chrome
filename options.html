@@ -72,6 +72,29 @@
     <label class="inline"><input type="checkbox" id="notifyAll"> Notifier aussi pour tous les autres torrents de qBittorrent</label>
   </fieldset>
 
+  <fieldset>
+    <legend>Score des torrents</legend>
+    <label>Profil du score
+      <select id="scorePreset">
+        <option value="equilibre">Équilibré (par défaut)</option>
+        <option value="qualite">Qualité d’image</option>
+        <option value="vf">VF / MULTI d’abord</option>
+        <option value="leger">Petite taille</option>
+        <option value="ratio">Ratio (seeders)</option>
+        <option value="perso">Personnalisé</option>
+      </select>
+    </label>
+    <p><small id="scoreHint"></small></p>
+    <div id="scoreCustom" hidden>
+      <label>Langue (VF/MULTI) <input id="weightLang" type="number" min="0" max="100" step="1"></label>
+      <label>Qualité <input id="weightQuality" type="number" min="0" max="100" step="1"></label>
+      <label>Santé (seeders) <input id="weightHealth" type="number" min="0" max="100" step="1"></label>
+      <label>Taille <input id="weightSize" type="number" min="0" max="100" step="1"></label>
+      <p><small>Poids entiers de 0 à 100 : seul leur rapport compte, et un poids à 0 ignore le critère.</small></p>
+    </div>
+    <p><small>Le score classe les versions d’un même film dans la fiche et dans les listes C411. Le changement s’applique au retour sur l’onglet C411 ou au rechargement de la page.</small></p>
+  </fieldset>
+
   <div class="row"><button id="save">Enregistrer</button></div>
   <div id="status"></div>
   <script src="options.js"></script>

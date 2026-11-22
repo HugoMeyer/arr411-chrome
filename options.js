@@ -3,7 +3,8 @@ const DEFAULTS = {
   radarrUrl: '', radarrKey: '', radarrRoot: '', radarrProfile: '', radarrCategory: '',
   sonarrUrl: '', sonarrKey: '', sonarrRoot: '', sonarrProfile: '', sonarrCategory: '',
   lidarrUrl: '', lidarrKey: '', lidarrRoot: '', lidarrProfile: '', lidarrMetaProfile: '', lidarrCategory: 'lidarr',
-  notifyEnabled: true, notifyAll: false, listBadges: true
+  notifyEnabled: true, notifyAll: false, listBadges: true,
+  scorePreset: 'equilibre', scoreWeights: { lang: 30, quality: 30, health: 20, size: 20 }
 };
 const CHECK_FIELDS = ['notifyEnabled', 'notifyAll', 'listBadges'];
 const TEXT_FIELDS = ['qbUrl', 'username', 'password', 'radarrUrl', 'radarrKey', 'sonarrUrl', 'sonarrKey', 'lidarrUrl', 'lidarrKey'];
@@ -11,6 +12,16 @@ const CAT_FIELDS = ['defaultCategory', 'radarrCategory', 'sonarrCategory', 'lida
 const ARR_FIELDS = ['radarrProfile', 'radarrRoot', 'sonarrProfile', 'sonarrRoot', 'lidarrProfile', 'lidarrMetaProfile', 'lidarrRoot'];
 const SELECT_FIELDS = [...CAT_FIELDS, ...ARR_FIELDS];
 const ARR_NAMES = { radarr: 'Radarr', sonarr: 'Sonarr', lidarr: 'Lidarr' };
+const SCORE_PRESETS = ['equilibre', 'qualite', 'vf', 'leger', 'ratio', 'perso'];
+const SCORE_HINTS = {
+  equilibre: 'Langue et qualité d’abord, puis seeders et taille : le réglage d’origine.',
+  qualite: 'La qualité d’image prime : résolution, source, HDR et audio.',
+  vf: 'La langue prime : MULTI.VFF et VOF loin devant VF2, VFQ et VOSTFR.',
+  leger: 'La taille prime : les versions légères et de bonne qualité passent devant.',
+  ratio: 'Les seeders priment, pour faire du ratio. Seules les listes les connaissent pour toutes les versions : sur une fiche, ce profil change peu.',
+  perso: 'Choisis toi-même le poids de chaque critère.'
+};
+const WEIGHT_FIELDS = { lang: 'weightLang', quality: 'weightQuality', health: 'weightHealth', size: 'weightSize' };
 const $ = (id) => document.getElementById(id);
 let saved = {};
 
@@ -27,6 +38,25 @@ function fillSelect(sel, items, selected, emptyLabel) {
   sel.value = selected || '';
 }
 
+function readWeights() {
+  const out = {};
+  for (const k of Object.keys(WEIGHT_FIELDS)) {
+    const v = $(WEIGHT_FIELDS[k]).value.trim();
+    out[k] = v === '' ? NaN : Number(v);
+  }
+  return out;
+}
+
+// Integers from 0 to 100, at least one above 0.
+const validWeights = (w) => Object.values(w).every((v) => Number.isInteger(v) && v >= 0 && v <= 100)
+  && Object.values(w).some((v) => v > 0);
+
+function showScore() {
+  const preset = $('scorePreset').value;
+  $('scoreHint').textContent = SCORE_HINTS[preset] || '';
+  $('scoreCustom').hidden = preset !== 'perso';
+}
+
 function readForm() {
   const cfg = {};
   for (const f of TEXT_FIELDS) {
@@ -36,11 +66,19 @@ function readForm() {
   for (const f of SELECT_FIELDS) cfg[f] = $(f).value;
   for (const f of CHECK_FIELDS) cfg[f] = $(f).checked;
   cfg.qbUrl = cfg.qbUrl || DEFAULTS.qbUrl;
+  cfg.scorePreset = SCORE_PRESETS.includes($('scorePreset').value) ? $('scorePreset').value : DEFAULTS.scorePreset;
+  // The custom weights are kept while another preset is chosen; unusable ones never replace the saved ones.
+  const weights = readWeights();
+  cfg.scoreWeights = validWeights(weights) ? weights : (saved.scoreWeights || DEFAULTS.scoreWeights);
   return cfg;
 }
 
 async function save() {
   const cfg = readForm();
+  if (cfg.scorePreset === 'perso' && !validWeights(readWeights())) {
+    status('Score personnalisé : chaque poids doit être un entier de 0 à 100, et l’un d’eux au moins doit dépasser 0.', false);
+    return false;
+  }
   const origins = [];
   for (const f of ['qbUrl', 'radarrUrl', 'sonarrUrl', 'lidarrUrl']) {
     if (!cfg[f]) continue;
@@ -89,7 +127,12 @@ async function testArr(service) {
   for (const f of CAT_FIELDS) fillSelect($(f), [], saved[f], '(aucune)');
   for (const f of ARR_FIELDS) fillSelect($(f), [], saved[f], '(cliquer sur Tester)');
   for (const f of CHECK_FIELDS) $(f).checked = saved[f];
+  const weights = { ...DEFAULTS.scoreWeights, ...(saved.scoreWeights && typeof saved.scoreWeights === 'object' ? saved.scoreWeights : {}) };
+  for (const k of Object.keys(WEIGHT_FIELDS)) $(WEIGHT_FIELDS[k]).value = String(weights[k]);
+  $('scorePreset').value = SCORE_PRESETS.includes(saved.scorePreset) ? saved.scorePreset : DEFAULTS.scorePreset;
+  showScore();
 
+  $('scorePreset').onchange = showScore;
   $('save').onclick = save;
   $('test').onclick = testQbit;
   for (const b of document.querySelectorAll('[data-load]')) b.onclick = () => testArr(b.dataset.load);

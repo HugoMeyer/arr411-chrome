@@ -13,6 +13,14 @@ Installation :
 Badges de score : sur la page d'un torrent, dans la liste "Versions" et dans les resultats, une pastille de 0 a 100
 note chaque version (langue, qualite, seeders, taille). Etoile = meilleur choix, balance = meilleur rapport
 qualite/taille, losange = meilleure qualite, eclair = plus de seeders. Clique sur la pastille pour le detail.
+Profil du score : dans Options > "Score des torrents", choisis ce qui compte le plus (Equilibre par defaut, Qualite d'image,
+VF / MULTI d'abord, Petite taille, Ratio, ou Personnalise avec tes propres poids). Le changement s'applique en revenant sur l'onglet C411.
+
+Espace disque : le dialogue d'envoi affiche l'espace libre de la categorie choisie et previent, sans bloquer, si le torrent
+ne tient pas (qBittorrent 5.3 ou plus recent ; avant, rien ne s'affiche).
+
+Mise a jour : le popup de l'extension signale une nouvelle version (verification toutes les 12 h au plus, aucune donnee envoyee).
+Pour mettre a jour : recupere le depot, puis clique sur le bouton de rechargement de l'extension dans chrome://extensions.
 
 Radarr/Sonarr/Lidarr : les films/series/albums sont ajoutes NON surveilles, sans recherche automatique.
 Lidarr : categorie qBittorrent "lidarr" par defaut. L'album est detecte grace a la fiche musique de C411

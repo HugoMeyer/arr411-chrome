@@ -234,7 +234,43 @@
     renderBadge();
   }
 
-  // ctx (list rows): { name, qbit } — no Radarr/Sonarr/Lidarr IDs are available outside the torrent page.
+  // ==== space:begin ====
+  const GIB = 1073741824;
+
+  // Sizes counted like the page and qBittorrent do (powers of 1024), with French unit names and decimal comma.
+  function formatBytes(bytes) {
+    const units = ['o', 'Ko', 'Mo', 'Go', 'To', 'Po'];
+    let v = Math.max(0, bytes);
+    let u = 0;
+    while (v >= 1023.5 && u < units.length - 1) { v /= 1024; u++; }
+    const digits = u === 0 || v >= 100 ? 0 : 1;
+    return `${v.toFixed(digits).replace('.', ',').replace(/,0$/, '')} ${units[u]}`;
+  }
+
+  // What the send dialog says about the disk for the chosen category: { info, warn } ('' = nothing to say).
+  // space: the `space` of the getCategories reply (null when qBittorrent can't tell); sizeGB: the torrent's size,
+  // null when unknown. A torrent that would leave less than 1 Gio free is warned about.
+  function spaceNote(space, category, sizeGB) {
+    const note = { info: '', warn: '' };
+    if (!space || typeof space !== 'object') return note;
+    const own = (o, k) => !!o && typeof o === 'object' && Object.prototype.hasOwnProperty.call(o, k);
+    const path = category ? (own(space.categoryPaths, category) ? space.categoryPaths[category] : null) : space.defaultPath;
+    const free = typeof path === 'string' && own(space.byPath, path) ? space.byPath[path] : null;
+    if (typeof free !== 'number' || !isFinite(free) || free < 0) return note;
+    note.info = `Espace libre : ${formatBytes(free)}`;
+    if (typeof sizeGB === 'number' && isFinite(sizeGB) && sizeGB > 0 && sizeGB * GIB > free - GIB) {
+      note.warn = `⚠ Espace disque insuffisant : ce torrent fait ${formatBytes(sizeGB * GIB)}, il reste ${formatBytes(free)}.`;
+    }
+    return note;
+  }
+  // ==== space:end ====
+
+  // The size of the torrent being sent, in GiB: the one of the torrent page, or of the clicked row. Null when unknown.
+  const torrentSize = (ctx) => {
+    try { return ctx ? ctx.sizeGB : (pageStats() || {}).sizeGB; } catch (e) { return null; }
+  };
+
+  // ctx (list rows): { name, qbit, sizeGB } — no Radarr/Sonarr/Lidarr IDs are available outside the torrent page.
   function chooseCategory(ctx = null) {
     const listMode = !!ctx;
     const detected = listMode ? { type: '', ids: {} } : detectMedia();
@@ -272,6 +308,9 @@
           input[type=text] { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 6px;
                   background: #2b2b33; color: #eee; border: 1px solid #444; }
           .hint { font-size: 12px; color: #999; margin-top: 4px; }
+          .space { font-size: 12px; color: #999; margin-top: 4px; }
+          .lowspace { background: #f59e0b22; color: #fbbf24; border: 1px solid #f59e0b66; border-radius: 6px;
+                  padding: 8px 10px; margin-top: 8px; }
           .tname { font-size: 12px; color: #bbb; margin: -6px 0 12px; word-break: break-all; }
           .listhint { margin: 0 0 4px; }
         </style>
@@ -318,6 +357,8 @@
             </div>
             <div class="lbl">Catégorie qBittorrent</div>
             <select class="cat" disabled><option>Chargement des catégories…</option></select>
+            <div class="space" hidden></div>
+            <div class="lowspace" hidden></div>
             <label><input type="checkbox" class="paused"> Ajouter en pause</label>
             <div class="err" hidden></div>
             <div class="row">
@@ -339,6 +380,9 @@
       const albumInput = root.querySelector('.album');
       const arrBox = root.querySelector('.arr');
       const warn = root.querySelector('.warn');
+      const spaceInfo = root.querySelector('.space');
+      const spaceWarn = root.querySelector('.lowspace');
+      const sizeGB = torrentSize(ctx);
       const SERVICE = { movie: 'radarr', series: 'sonarr', music: 'lidarr' };
       const guess = detected.type === 'music' ? detected : guessMusic();
       artistInput.value = guess.artist || '';
@@ -382,7 +426,7 @@
         } : null
       });
 
-      const res = await send({ type: 'getCategories' });
+      const res = await send({ type: 'getCategories', withSpace: true });
       if (!res.ok) {
         select.innerHTML = '<option value="">(aucune catégorie)</option>';
         err.hidden = false;
@@ -399,9 +443,20 @@
       }
       const hasIds = detected.type === 'music' || detected.ids.imdb || detected.ids.tmdb || detected.ids.tvdb;
       typeSelect.value = hasIds && res.arrEnabled[detected.type] ? detected.type : '';
+      // Non-blocking: the free space of the chosen category, and a warning when the torrent might not fit.
+      const showSpace = () => {
+        const note = spaceNote(res.space, select.value, sizeGB);
+        spaceInfo.hidden = !note.info;
+        spaceInfo.textContent = note.info;
+        spaceWarn.hidden = !note.warn;
+        spaceWarn.textContent = note.warn;
+        ok.textContent = note.warn ? 'Envoyer quand même' : 'Envoyer';
+      };
+      select.onchange = showSpace;
       const applyTypeCategory = () => {
         const cat = res.byType[typeSelect.value];
         if (cat && res.categories.includes(cat)) select.value = cat;
+        showSpace();
       };
       const guessSeriesType = () => {
         stypeSelect.value = /anim/i.test(rootSelect.value) ? 'anime' : 'standard';
@@ -625,9 +680,18 @@
       }
       // innerText: only the layout shown at this screen size (rows hold both a desktop and a mobile one).
       const name = a ? (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim() : '';
-      sendToQbit(btn, { name, qbit });
+      sendToQbit(btn, { name, qbit, sizeGB: rowSize(row) || (a ? rowSize(a) : null) });
     });
     return ours;
+  }
+
+  // The size a result row shows (its first cell that reads as one), in GiB. Null when it shows none.
+  function rowSize(el) {
+    for (const c of cellsOf(el)) {
+      const size = parseSize(c.text);
+      if (size !== null) return size;
+    }
+    return null;
   }
 
   const hasDownloadIcon = (btn) => !!btn.querySelector('[class*="arrow-down-tray"]');
@@ -945,9 +1009,21 @@
 
   const bandColor = (score) => (score >= 80 ? '#22c55e' : score >= 65 ? '#84cc16' : score >= 50 ? '#f59e0b' : '#ef4444');
 
+  // The weights of the settings when they are usable (each a number from 0 to 100, one at least above 0), else null.
+  function cleanWeights(w) {
+    if (!w || typeof w !== 'object') return null;
+    const out = {};
+    for (const k of Object.keys(WEIGHTS)) {
+      if (typeof w[k] !== 'number' || !isFinite(w[k])) return null;
+      out[k] = Math.min(100, Math.max(0, w[k]));
+    }
+    return Object.keys(out).some((k) => out[k] > 0) ? out : null;
+  }
+
   // Scores the torrents of one film against each other. entries: [{ release, sizeGB, seeders }] (null = unknown).
   // Seeders and sizes only count when they are known for every entry, so that the scores stay comparable.
-  function scoreGroup(entries) {
+  // wanted: the { lang, quality, health, size } weights of the settings; the default ones apply when absent or unusable.
+  function scoreGroup(entries, wanted) {
     const n = entries.length;
     const known = (v) => typeof v === 'number' && isFinite(v);
     const useHealth = n > 0 && entries.every((e) => known(e.seeders));
@@ -958,9 +1034,15 @@
     const mid = sized ? median(ratios) : 0;
     const useSize = sized && mid > 0;
 
-    const weights = { lang: WEIGHTS.lang, quality: WEIGHTS.quality };
-    if (useHealth) weights.health = WEIGHTS.health;
-    if (useSize) weights.size = WEIGHTS.size;
+    // Only the parts that can be computed count. If the settings give them no weight at all, the default weights apply.
+    const weightsOf = (w) => {
+      const out = { lang: w.lang, quality: w.quality };
+      if (useHealth) out.health = w.health;
+      if (useSize) out.size = w.size;
+      return out;
+    };
+    let weights = weightsOf(cleanWeights(wanted) || WEIGHTS);
+    if (!Object.keys(weights).some((k) => weights[k] > 0)) weights = weightsOf(WEIGHTS);
     const total = Object.keys(weights).reduce((t, k) => t + weights[k], 0);
     const max = {};
     for (const k of Object.keys(weights)) max[k] = 100 * weights[k] / total;
@@ -1013,19 +1095,60 @@
   const describe = (r) => ['lang', 'res', 'src', 'hdr', 'audio', 'codec'].map((k) => r[k] && r[k].label).filter(Boolean).join(' · ');
 
   // Multi-line French text: shown as the tooltip of a badge and in the toast of its click.
+  // group.profile (set by the caller) names the settings' profile when it is not the default one.
   function explain(entry, row, group) {
     const names = { lang: 'Langue', quality: 'Qualité', size: 'Qualité/taille', health: 'Seeders' };
     const lines = [`Score ${row.score}/100`];
     for (const k of row.awards) lines.push(`${AWARDS[k].glyph} ${AWARDS[k].label}`);
-    lines.push(['lang', 'quality', 'size', 'health'].filter((k) => row.parts[k] !== undefined)
+    lines.push(['lang', 'quality', 'size', 'health'].filter((k) => row.parts[k] !== undefined && group.max[k] > 0)
       .map((k) => `${names[k]} ${Math.round(100 * row.parts[k] / group.max[k])} %`).join(' · '));
     lines.push(describe(entry.release));
     if (row.dead) lines.push(`0 seeder : score plafonné à ${DEAD_CAP}, jamais recommandé.`);
     else if (typeof entry.seeders !== 'number') lines.push('Seeders inconnus : non comptés.');
     else if (!group.useHealth) lines.push(`Seeders : ${entry.seeders} (non comptés : inconnus pour les autres versions).`);
+    if (group.profile) lines.push(`Profil : ${group.profile}`);
     return lines.join('\n');
   }
   // ==== scoring:end ====
+
+  // ---------- Scoring profile: the weights chosen in the settings ----------
+
+  // ==== profile:begin ====
+  // The presets other than the default one, named as in the settings (same ids and labels in the apps).
+  const PROFILE_LABELS = {
+    qualite: 'Qualité d’image',
+    vf: 'VF / MULTI d’abord',
+    leger: 'Petite taille',
+    ratio: 'Ratio (seeders)',
+    perso: 'Personnalisé'
+  };
+  // The default weights apply until the engine has answered, and whenever it can't.
+  let profile = { preset: 'equilibre', weights: Object.assign({}, WEIGHTS) };
+  let scoringStarted = false;
+
+  function scoreWithProfile(entries) {
+    const group = scoreGroup(entries, profile.weights);
+    if (profile.preset !== 'equilibre') group.profile = PROFILE_LABELS[profile.preset];
+    return group;
+  }
+
+  // Asks the engine for the settings. An answer that is missing or unusable keeps what is already known.
+  async function loadProfile() {
+    try {
+      const res = await send({ type: 'pagePrefs' });
+      const score = res && res.ok && res.score;
+      const weights = score && cleanWeights(score.weights);
+      if (!weights) return;
+      const known = score.preset === 'equilibre' || Object.prototype.hasOwnProperty.call(PROFILE_LABELS, score.preset);
+      const preset = known ? score.preset : 'perso';
+      if (preset === profile.preset && JSON.stringify(weights) === JSON.stringify(profile.weights)) return;
+      profile = { preset, weights };
+      if (scoringStarted) refreshScores();
+    } catch (e) {
+      console.warn('Arr411 : réglages du score indisponibles', e);
+    }
+  }
+  // ==== profile:end ====
 
   // ---------- Scoring badges: torrent page and lists ----------
 
@@ -1220,7 +1343,7 @@
     const entries = rows.map((r) => r.entry);
     if (at >= 0) entries[at] = Object.assign({}, entries[at], { seeders });
     else { entries.push({ release, sizeGB: stats ? stats.sizeGB : null, seeders }); at = entries.length - 1; }
-    const group = scoreGroup(entries);
+    const group = scoreWithProfile(entries);
     rows.forEach((r, i) => paintVersion(r, entries[i], group.rows[i], group, live));
     paintPage(stats, entries[at], group.rows[at], group, live);
   }
@@ -1280,7 +1403,7 @@
       else groups.set(key, [item]);
     }
     for (const items of [...groups.values(), ...batches]) {
-      const group = scoreGroup(items.map((i) => i.entry));
+      const group = scoreWithProfile(items.map((i) => i.entry));
       items.forEach((item, i) => paintListItem(item, group.rows[i], group, live));
     }
   }
@@ -1329,6 +1452,7 @@
   }
 
   whenHydrated(() => {
+    scoringStarted = true;
     new MutationObserver((mutations) => {
       if (mutations.every(isOwnMutation)) return;
       scheduleInject();
@@ -1341,4 +1465,8 @@
     refreshListBadges();
     refreshScores();
   });
+
+  // A change of the settings applies when the user comes back to the tab, without reloading the page.
+  loadProfile();
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) loadProfile(); });
 })();
