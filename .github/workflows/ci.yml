@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request replaces its older run. A run of main is never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Check and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The extension has no dependency: nothing to install. 26 is the current LTS.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+
+      - name: Check the syntax of every script
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t files < <(find . -type d \( -name .git -o -name node_modules -o -name test \) -prune -o -type f -name '*.js' -print0)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo '::error::No .js file to check'
+            exit 1
+          fi
+          status=0
+          for file in "${files[@]}"; do
+            echo "node --check $file"
+            node --check "$file" || status=1
+          done
+          exit "$status"
+
+      # node --test runs every *.test.js under test/, including the ones added later, but passes when it finds none.
+      - name: Run the tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$(find test -type f -name '*.test.js' -print -quit)" ]; then
+            echo '::error::No test/**/*.test.js file: node --test would run nothing and still pass'
+            exit 1
+          fi
+          node --test test/
