@@ -90,7 +90,10 @@ for (const b of document.querySelectorAll('[data-tab]')) {
 $('options').onclick = () => chrome.runtime.openOptionsPage();
 $('open').onclick = async () => {
   const { qbUrl = '' } = await chrome.storage.local.get('qbUrl');
-  chrome.tabs.create({ url: qbUrl });
+  try {
+    const url = new URL(qbUrl);
+    if (['https:', 'http:', 'magnet:'].includes(url.protocol)) chrome.tabs.create({ url: url.href });
+  } catch {}
 };
 
 refresh();

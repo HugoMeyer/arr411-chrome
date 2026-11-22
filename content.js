@@ -3,7 +3,10 @@
   const SCORE = 'data-qbt-score';
   const SCORE_TRACK_PX = 60;
   const ARM_TIMEOUT_MS = 20000;
+  const MAX_TORRENT_BYTES = 16 * 1024 * 1024; // same limit as the engine and the native layers
+  const TOO_BIG = 'Fichier .torrent trop volumineux (16 Mo maximum)';
   let armTimer = null;
+  let awaitingTorrent = false;
 
   const norm = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim();
 
@@ -462,8 +465,10 @@
     const armed = await send({ type: 'arm', ...choice });
     if (!armed.ok) return toast(armed.error, true);
 
+    awaitingTorrent = true;
     clearTimeout(armTimer);
     armTimer = setTimeout(() => {
+      awaitingTorrent = false;
       send({ type: 'disarm' });
       toast('Aucun téléchargement détecté. Réessaie.', true);
     }, ARM_TIMEOUT_MS);
@@ -477,7 +482,9 @@
     try {
       const res = await fetch(url, { credentials: 'include' });
       if (!res.ok) throw new Error(`Téléchargement du .torrent impossible (${res.status})`);
+      if (Number(res.headers && res.headers.get('content-length')) > MAX_TORRENT_BYTES) throw new Error(TOO_BIG);
       const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.length > MAX_TORRENT_BYTES) throw new Error(TOO_BIG);
       const head = new TextDecoder('latin1').decode(bytes.slice(0, 4096));
       if (head[0] !== 'd' || !new TextDecoder('latin1').decode(bytes).includes('4:info')) {
         throw new Error('Le fichier récupéré n’est pas un .torrent valide');
@@ -495,8 +502,11 @@
     }
   }
 
+  // Only answers a download this page armed itself: on Android and Desktop the page world can reach this listener.
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === 'fetchTorrent') handleTorrent(msg);
+    if (!msg || msg.type !== 'fetchTorrent' || !awaitingTorrent || typeof msg.url !== 'string') return;
+    awaitingTorrent = false;
+    handleTorrent(msg);
   });
 
   // ---------- qBittorrent buttons: torrent page, and right after each download icon in lists ----------
@@ -533,12 +543,13 @@
     ours.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      sendToQbit(btn);
+      if (e.isTrusted) sendToQbit(btn);
     });
     return ours;
   }
 
-  const gridToken = (el) => (typeof el.className === 'string'
+  // `includes` first: most elements have no such class, and splitting every class list is what made a scan slow.
+  const gridToken = (el) => (typeof el.className === 'string' && el.className.includes('lg:grid-cols-[')
     ? (el.className.split(/\s+/).find((c) => c.startsWith('lg:grid-cols-[')) || '') : '');
 
   // Result rows are CSS grids whose columns come from a `lg:grid-cols-[…]` class. Only a few levels up
@@ -605,6 +616,7 @@
     ours.addEventListener('click', async (e) => {
       e.preventDefault();
       e.stopPropagation();
+      if (!e.isTrusted) return;
       const a = rowLink(row);
       let qbit = null;
       if (a) {
@@ -1285,6 +1297,21 @@
   }
 
   let refreshTimer = null;
+  let injectTimer = null;
+  let injectPending = false;
+  const INJECT_WINDOW_MS = 100;
+
+  // The first mutation after a quiet spell is handled at once (our buttons show up in the same frame as the
+  // page's rows); the ones that follow within the window are merged into a single scan at its end.
+  function scheduleInject() {
+    if (injectTimer !== null) { injectPending = true; return; }
+    injectPending = false;
+    inject();
+    injectTimer = setTimeout(() => {
+      injectTimer = null;
+      if (injectPending) scheduleInject();
+    }, INJECT_WINDOW_MS);
+  }
   const isOwn = (n) => n.nodeType === 1 && (n.hasAttribute(PILL) || n.hasAttribute(MARK) || n.hasAttribute(SCORE));
   // The removal of one of our buttons (e.g. by a Vue re-render) is a page change: it must be put back.
   const isOwnButton = (n) => n.nodeType === 1 && n.tagName === 'BUTTON' && n.hasAttribute(MARK);
@@ -1304,7 +1331,7 @@
   whenHydrated(() => {
     new MutationObserver((mutations) => {
       if (mutations.every(isOwnMutation)) return;
-      inject();
+      scheduleInject();
       clearTimeout(refreshTimer);
       refreshTimer = setTimeout(() => { refreshStatus(); refreshListBadges(); refreshScores(); }, 600);
     }).observe(document.documentElement, { childList: true, subtree: true });

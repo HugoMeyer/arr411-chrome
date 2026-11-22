@@ -14,6 +14,63 @@ async function getConfig() {
   return cfg;
 }
 
+// ---------- Redirects and URLs ----------
+
+// A request that carries a secret (qBittorrent password, the .torrent uploaded with its tracker passkey, Radarr/Sonarr/Lidarr
+// API key) must never follow a redirect to another server: a 307/308 would send it the same body and headers. Redirects are
+// followed by hand, within the same host only.
+const MAX_REDIRECTS = 5;
+const REDIRECT_HINT = 'mets l’adresse finale dans les réglages';
+
+// An http → https upgrade of the same host is fine, and may change the port.
+function sameServer(from, to) {
+  try {
+    const a = new URL(from);
+    const b = new URL(to);
+    if (a.hostname !== b.hostname) return false;
+    if (a.protocol === b.protocol) return a.port === b.port;
+    return a.protocol === 'http:' && b.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function hostOf(url) {
+  try { return new URL(url).host; } catch { return String(url).slice(0, 80); }
+}
+
+async function secretFetch(url, opts = {}) {
+  let target = String(url);
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const res = await fetch(target, { ...opts, redirect: 'manual' });
+    // Only a browser answers a redirect with an opaque response; the shims of the apps never do (their native layer refuses
+    // cross-host redirects itself), so the usual path is a single request.
+    if (!res || res.type !== 'opaqueredirect') return res;
+    // The Location of an opaque redirect is hidden: a request without any secret finds where it leads.
+    const probe = await fetch(target, { method: 'GET', credentials: 'omit', redirect: 'follow' }).catch(() => null);
+    const next = probe && probe.url;
+    if (!next || next === target) throw new Error(`Redirection non vérifiable : ${REDIRECT_HINT}`);
+    if (!sameServer(target, next)) throw new Error(`Redirection vers un autre serveur refusée (${hostOf(next)}) : ${REDIRECT_HINT}`);
+    target = next;
+  }
+  throw new Error(`Trop de redirections : ${REDIRECT_HINT}`);
+}
+
+// Only web pages and magnet links are ever opened in a tab.
+function safeUrl(value) {
+  try {
+    const u = new URL(String(value));
+    return ['https:', 'http:', 'magnet:'].includes(u.protocol) ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function openUrl(value) {
+  const url = safeUrl(value);
+  if (url) chrome.tabs.create({ url });
+}
+
 // ---------- qBittorrent ----------
 
 // qBittorrent rejects requests whose Origin/Referer don't match its host (CSRF protection).
@@ -42,7 +99,7 @@ async function ensureHeaderRule(base) {
 }
 
 async function login(cfg) {
-  const res = await fetch(cfg.qbUrl + '/api/v2/auth/login', {
+  const res = await secretFetch(cfg.qbUrl + '/api/v2/auth/login', {
     method: 'POST',
     credentials: 'include',
     body: new URLSearchParams({ username: cfg.username, password: cfg.password })
@@ -55,7 +112,7 @@ async function login(cfg) {
 async function qbFetch(path, opts = {}, retry = true) {
   const cfg = await getConfig();
   await ensureHeaderRule(cfg.qbUrl);
-  const res = await fetch(cfg.qbUrl + path, { credentials: 'include', ...opts });
+  const res = await secretFetch(cfg.qbUrl + path, { credentials: 'include', ...opts });
   if ((res.status === 401 || res.status === 403) && retry) {
     await login(cfg);
     return qbFetch(path, opts, false);
@@ -71,6 +128,8 @@ async function getCategories() {
 
 async function addTorrent({ base64, filename, category, paused }) {
   const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  // A malformed file is refused before anything is sent. Other failures (no crypto in the page) only cost the completion notification.
+  const hash = await infoHash(bytes).catch((e) => { if (e.message === TORRENT_INVALID) throw e; return null; });
   const buildForm = () => {
     const form = new FormData();
     form.append('torrents', new Blob([bytes], { type: 'application/x-bittorrent' }), filename || 'file.torrent');
@@ -87,41 +146,67 @@ async function addTorrent({ base64, filename, category, paused }) {
   if (!res.ok || text === 'Fails.') throw new Error(`qBittorrent a refusé le torrent (${res.status} ${text})`);
   await chrome.storage.local.set({ lastCategory: category || '' });
   indexCache = null; // the list badges must see the torrent that was just added
-  const hash = await infoHash(bytes).catch(() => null);
   if (hash) await trackTorrent(hash, filename);
   return hash;
 }
 
-// Returns the index just past the bencoded element starting at i.
-function bencodeEnd(b, i) {
-  const c = b[i];
-  if (c === 0x69) { while (b[i] !== 0x65) i++; return i + 1; } // i...e
-  if (c === 0x6c || c === 0x64) { // l...e / d...e
-    i++;
-    while (b[i] !== 0x65) { if (i >= b.length) throw new Error('bencode'); i = bencodeEnd(b, i); }
-    return i + 1;
+const TORRENT_INVALID = 'Fichier .torrent invalide';
+const BENCODE_MAX_DEPTH = 64;
+const BENCODE_MAX_DIGITS = 10;
+const INFO_KEY = [0x69, 0x6e, 0x66, 0x6f]; // "info"
+
+// [start, end) of the content of the bencoded string at i ("4:spam"); its length must fit in what is left of the file.
+function bencodeStr(b, i) {
+  let k = i;
+  let len = 0;
+  while (k < b.length && b[k] >= 0x30 && b[k] <= 0x39) {
+    if (k - i >= BENCODE_MAX_DIGITS) throw new Error(TORRENT_INVALID);
+    len = len * 10 + (b[k] - 0x30);
+    k++;
   }
-  let colon = i;
-  while (b[colon] !== 0x3a) { if (colon >= b.length) throw new Error('bencode'); colon++; }
-  const len = Number(new TextDecoder('latin1').decode(b.subarray(i, colon)));
-  return colon + 1 + len;
+  if (k === i || b[k] !== 0x3a || len > b.length - k - 1) throw new Error(TORRENT_INVALID);
+  return [k + 1, k + 1 + len];
+}
+
+// Returns the index just past the bencoded element starting at i. Truncated, malformed or too deeply nested input throws.
+function bencodeEnd(b, i, depth = 0) {
+  if (depth > BENCODE_MAX_DEPTH || i >= b.length) throw new Error(TORRENT_INVALID);
+  const c = b[i];
+  if (c === 0x69) { // i...e
+    let k = i + 1;
+    if (b[k] === 0x2d) k++;
+    const digits = k;
+    while (k < b.length && b[k] >= 0x30 && b[k] <= 0x39) k++;
+    if (k === digits || b[k] !== 0x65) throw new Error(TORRENT_INVALID);
+    return k + 1;
+  }
+  if (c === 0x6c || c === 0x64) { // l...e / d...e
+    let k = i + 1;
+    while (k < b.length && b[k] !== 0x65) k = bencodeEnd(b, k, depth + 1);
+    if (k >= b.length) throw new Error(TORRENT_INVALID);
+    return k + 1;
+  }
+  return bencodeStr(b, i)[1];
+}
+
+// [start, end) of the bencoded "info" dictionary of a .torrent.
+function torrentInfoSpan(bytes) {
+  if (bytes[0] !== 0x64) throw new Error(TORRENT_INVALID);
+  let i = 1;
+  while (i < bytes.length && bytes[i] !== 0x65) {
+    const [keyStart, keyEnd] = bencodeStr(bytes, i);
+    const valEnd = bencodeEnd(bytes, keyEnd);
+    if (keyEnd - keyStart === INFO_KEY.length && INFO_KEY.every((c, n) => bytes[keyStart + n] === c)) return [keyEnd, valEnd];
+    i = valEnd;
+  }
+  throw new Error(TORRENT_INVALID);
 }
 
 // v1 infohash = SHA-1 of the raw bencoded "info" dictionary.
 async function infoHash(bytes) {
-  if (bytes[0] !== 0x64) return null;
-  let i = 1;
-  while (bytes[i] !== 0x65) {
-    const keyEnd = bencodeEnd(bytes, i);
-    const key = new TextDecoder('latin1').decode(bytes.subarray(bytes.indexOf(0x3a, i) + 1, keyEnd));
-    const valEnd = bencodeEnd(bytes, keyEnd);
-    if (key === 'info') {
-      const digest = await crypto.subtle.digest('SHA-1', bytes.slice(keyEnd, valEnd));
-      return [...new Uint8Array(digest)].map((x) => x.toString(16).padStart(2, '0')).join('');
-    }
-    i = valEnd;
-  }
-  return null;
+  const [start, end] = torrentInfoSpan(bytes);
+  const digest = await crypto.subtle.digest('SHA-1', bytes.slice(start, end));
+  return [...new Uint8Array(digest)].map((x) => x.toString(16).padStart(2, '0')).join('');
 }
 
 // ---------- Large libraries ----------
@@ -255,7 +340,7 @@ chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'poll') pollCompletion
 chrome.notifications.onClicked.addListener(async (id) => {
   chrome.notifications.clear(id);
   const cfg = await getConfig();
-  chrome.tabs.create({ url: cfg.qbUrl });
+  openUrl(cfg.qbUrl);
 });
 
 // ---------- Popup / list badges ----------
@@ -315,7 +400,7 @@ async function arr(service, path, opts = {}, cfgOverride) {
   const base = (cfg[service + 'Url'] || '').trim().replace(/\/+$/, '');
   const key = (cfg[service + 'Key'] || '').trim();
   if (!base || !key) throw new Error(`${ARR_LABEL[service]} n’est pas configuré`);
-  const res = await fetch(base + (service === 'lidarr' ? '/api/v1' : '/api/v3') + path, {
+  const res = await secretFetch(base + (service === 'lidarr' ? '/api/v1' : '/api/v3') + path, {
     ...opts,
     headers: { 'X-Api-Key': key, 'Content-Type': 'application/json' }
   });
@@ -345,13 +430,13 @@ const asList = (x) => (Array.isArray(x) ? x : x ? [x] : []);
 
 async function lookupMovie(ids) {
   let movie = null;
-  if (ids.tmdb && ids.tmdbKind !== 'tv') movie = first(await arr('radarr', `/movie/lookup/tmdb?tmdbId=${ids.tmdb}`).catch(() => null));
-  if (!movie && ids.imdb) movie = first(await arr('radarr', `/movie/lookup/imdb?imdbId=${ids.imdb}`).catch(() => null));
+  if (ids.tmdb && ids.tmdbKind !== 'tv') movie = first(await arr('radarr', `/movie/lookup/tmdb?tmdbId=${encodeURIComponent(ids.tmdb)}`).catch(() => null));
+  if (!movie && ids.imdb) movie = first(await arr('radarr', `/movie/lookup/imdb?imdbId=${encodeURIComponent(ids.imdb)}`).catch(() => null));
   return movie && movie.tmdbId ? movie : null;
 }
 
 async function findMovieInLibrary(tmdbId) {
-  const list = asList(await arr('radarr', `/movie?tmdbId=${tmdbId}`));
+  const list = asList(await arr('radarr', `/movie?tmdbId=${encodeURIComponent(tmdbId)}`));
   return list.find((m) => String(m.tmdbId) === String(tmdbId)) || null;
 }
 
@@ -371,13 +456,20 @@ async function lookupSeries(ids) {
 }
 
 async function findSeriesInLibrary(tvdbId) {
-  const list = asList(await arr('sonarr', `/series?tvdbId=${tvdbId}`));
+  const list = asList(await arr('sonarr', `/series?tvdbId=${encodeURIComponent(tvdbId)}`));
   return list.find((s) => String(s.tvdbId) === String(tvdbId)) || null;
+}
+
+// The root folder of an addition: the one chosen on the page only when the service really has it, the configured one otherwise.
+async function pickRoot(service, chosen, configured) {
+  if (!chosen || chosen === configured) return configured;
+  const roots = asList(await arr(service, '/rootfolder'));
+  return roots.some((r) => r.path === chosen) ? chosen : configured;
 }
 
 // Entries are always added unmonitored: downloads come from C411, never from Radarr/Sonarr.
 async function addMovie(ids, cfg, rootFolder) {
-  rootFolder = rootFolder || cfg.radarrRoot;
+  rootFolder = await pickRoot('radarr', rootFolder, cfg.radarrRoot);
   if (!rootFolder || !cfg.radarrProfile) throw new Error('Radarr : dossier racine / profil qualité non configurés');
   const movie = await lookupMovie(ids);
   if (!movie) throw new Error('Radarr : film introuvable');
@@ -398,7 +490,7 @@ async function addMovie(ids, cfg, rootFolder) {
 }
 
 async function addSeries(ids, cfg, rootFolder, seriesType) {
-  rootFolder = rootFolder || cfg.sonarrRoot;
+  rootFolder = await pickRoot('sonarr', rootFolder, cfg.sonarrRoot);
   if (!rootFolder || !cfg.sonarrProfile) throw new Error('Sonarr : dossier racine / profil qualité non configurés');
   const series = await lookupSeries(ids);
   if (!series) throw new Error('Sonarr : série introuvable');
@@ -477,7 +569,7 @@ async function musicIds(media) {
 
 async function lidarrFindArtist(mbArtist, name) {
   if (MBID.test(mbArtist || '')) {
-    const a = asList(await arr('lidarr', `/artist?mbId=${mbArtist}`)).find((x) => x.foreignArtistId === mbArtist);
+    const a = asList(await arr('lidarr', `/artist?mbId=${encodeURIComponent(mbArtist)}`)).find((x) => x.foreignArtistId === mbArtist);
     if (a || !name) return a || null;
   }
   if (!name) return null;
@@ -512,10 +604,12 @@ async function lidarrLookupAlbum(media, ids) {
 }
 
 // Root folder + profiles: options first, then the root folder defaults. "None" = only manually added albums.
+// A root folder chosen on the page counts only when Lidarr lists it.
 async function lidarrTarget(cfg, rootFolder, forArtist) {
   const [roots, qps, mps] = (await Promise.all(['/rootfolder', '/qualityprofile', '/metadataprofile']
     .map((p) => arr('lidarr', p, {}, cfg)))).map(asList);
-  const path = rootFolder || cfg.lidarrRoot || (roots[0] && roots[0].path);
+  const chosen = rootFolder && roots.some((r) => r.path === rootFolder) ? rootFolder : '';
+  const path = chosen || cfg.lidarrRoot || (roots[0] && roots[0].path);
   if (!path) throw new Error('Lidarr : aucun dossier racine');
   const rf = roots.find((r) => r.path === path) || {};
   const pick = (list, ids, ok = () => true) => ids.map(Number).find((id) => list.some((p) => p.id === id && ok(p)));
@@ -555,7 +649,7 @@ async function addMusic(media, cfg) {
   if (!album) throw new Error('Lidarr : album introuvable (corrige artiste / album, ou choisis « L’artiste seul »)');
   const name = album.title + (album.artist && album.artist.artistName ? ` — ${album.artist.artistName}` : '');
   if (album.id) return `déjà dans Lidarr (${name})`;
-  const inLib = asList(await arr('lidarr', `/album?foreignAlbumId=${album.foreignAlbumId}`))
+  const inLib = asList(await arr('lidarr', `/album?foreignAlbumId=${encodeURIComponent(album.foreignAlbumId)}`))
     .find((x) => x.foreignAlbumId === album.foreignAlbumId);
   if (inLib) return `déjà dans Lidarr (${name})`;
   let artist = album.artist || {};
@@ -582,7 +676,8 @@ async function addToArr(media) {
 // ---------- Page status (duplicates / library) ----------
 
 async function qbTorrentByHash(hash) {
-  const res = await qbFetch(`/api/v2/torrents/info?hashes=${hash.toLowerCase()}`);
+  if (typeof hash !== 'string' || !HASH.test(hash)) throw new Error('Requête refusée : hash invalide');
+  const res = await qbFetch(`/api/v2/torrents/info?hashes=${encodeURIComponent(hash.toLowerCase())}`);
   if (!res.ok) throw new Error(`qBittorrent ${res.status}`);
   const t = first(await res.json());
   return t ? { name: t.name, state: t.state, progress: t.progress, category: t.category } : null;
@@ -624,13 +719,13 @@ async function musicStatus(media) {
   let album = null;
   let artist = null;
   if (ids.mbReleaseGroup) {
-    album = asList(await arr('lidarr', `/album?foreignAlbumId=${ids.mbReleaseGroup}`))
+    album = asList(await arr('lidarr', `/album?foreignAlbumId=${encodeURIComponent(ids.mbReleaseGroup)}`))
       .find((x) => x.foreignAlbumId === ids.mbReleaseGroup) || null;
   }
   if (!album) {
     artist = await lidarrFindArtist(ids.mbArtist, media.artist);
     if (artist && media.album) {
-      album = asList(await arr('lidarr', `/album?artistId=${artist.id}`))
+      album = asList(await arr('lidarr', `/album?artistId=${encodeURIComponent(artist.id)}`))
         .find((x) => normTitle(x.title) === normTitle(media.album)) || null;
     }
   }
@@ -678,8 +773,162 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   });
 });
 
+// ---------- Messages from the page ----------
+
+// The C411 page is not trusted: what it asks of the engine is rebuilt here from validated fields only, never passed through as is.
+// The engine is shared by the 3 apps, and the shims of Android/Desktop give every sender the same identity: the checks apply to all.
+const MAX_TORRENT_BYTES = 16 * 1024 * 1024; // same limit as the native layers
+const TOO_BIG = 'fichier .torrent trop volumineux (16 Mo maximum)';
+const MAX_INDEX_HASHES = 300;               // what a page asks at most in one qbitIndex
+const HASH = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+const IMDB_ID = /^tt\d{1,10}$/;
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+const CONTROL = /[\u0000-\u001f\u007f]/;
+const SERVICES = ['radarr', 'sonarr', 'lidarr'];
+const MEDIA_TYPES = ['movie', 'series', 'music'];
+const SERIES_TYPES = ['standard', 'anime', 'daily'];
+const MUSIC_MODES = ['album', 'artist'];
+
+const refuse = (what) => new Error(`Requête refusée : ${what}`);
+const isObject = (x) => !!x && typeof x === 'object' && !Array.isArray(x);
+const isBlank = (x) => x === undefined || x === null || x === '';
+
+const pageHash = (v) => {
+  if (typeof v !== 'string' || !HASH.test(v)) throw refuse('hash invalide');
+  return v.toLowerCase();
+};
+
+const pageFlag = (v, what) => {
+  if (v === undefined || v === null) return false;
+  if (typeof v !== 'boolean') throw refuse(`${what} invalide`);
+  return v;
+};
+
+const pageText = (v, max, what) => {
+  if (isBlank(v)) return '';
+  if (typeof v !== 'string' || v.length > max || CONTROL.test(v)) throw refuse(`${what} invalide`);
+  return v;
+};
+
+const pageEnum = (v, list, what) => {
+  if (!list.includes(v)) throw refuse(`${what} invalide`);
+  return v;
+};
+
+// Free text read from the page (artist, album): cleaned up rather than refused.
+const pageLabel = (v) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f\s]+/g, ' ').trim().slice(0, 200) : '');
+
+function pageFilename(v) {
+  if (isBlank(v)) return 'file.torrent';
+  if (typeof v !== 'string') throw refuse('nom de fichier invalide');
+  return v.replace(/[\u0000-\u001f\u007f\\/]/g, '').trim().slice(0, 255) || 'file.torrent';
+}
+
+function pageBase64(v) {
+  if (typeof v !== 'string' || !v) throw refuse('fichier .torrent manquant');
+  if (v.length > Math.ceil(MAX_TORRENT_BYTES / 3) * 4) throw refuse(TOO_BIG);
+  if (v.length % 4 === 1 || !BASE64.test(v)) throw refuse('fichier .torrent invalide');
+  const padding = v.endsWith('==') ? 2 : v.endsWith('=') ? 1 : 0;
+  if (Math.floor(v.length * 3 / 4) - padding > MAX_TORRENT_BYTES) throw refuse(TOO_BIG);
+  return v;
+}
+
+function numericId(v) {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && /^\d{1,10}$/.test(v) ? Number(v) : NaN;
+  return Number.isSafeInteger(n) && n > 0 && n <= 9999999999 ? String(n) : null;
+}
+const imdbId = (v) => (typeof v === 'string' && IMDB_ID.test(v) ? v : null);
+const mbId = (v) => (typeof v === 'string' && MBID.test(v) ? v.toLowerCase() : null);
+const tmdbKind = (v) => (v === 'movie' || v === 'tv' ? v : null);
+const ID_RULES = {
+  tmdb: numericId, tvdb: numericId, deezer: numericId, discogs: numericId,
+  imdb: imdbId, mbRelease: mbId, mbReleaseGroup: mbId, mbArtist: mbId, tmdbKind
+};
+
+function cleanIds(ids) {
+  if (isBlank(ids)) return {};
+  if (!isObject(ids)) throw refuse('identifiants invalides');
+  const out = {};
+  for (const [key, rule] of Object.entries(ID_RULES)) {
+    if (isBlank(ids[key])) continue;
+    const value = rule(ids[key]);
+    if (value === null) throw refuse(`identifiant ${key} invalide`);
+    out[key] = value;
+  }
+  return out;
+}
+
+function cleanSeasons(v) {
+  if (isBlank(v)) return [];
+  if (!Array.isArray(v)) throw refuse('saisons invalides');
+  return v.slice(0, 200).filter((n) => Number.isInteger(n) && n >= 0 && n <= 99).slice(0, 100);
+}
+
+function cleanMedia(m) {
+  if (isBlank(m)) return null;
+  if (!isObject(m)) throw refuse('média invalide');
+  if (isBlank(m.type)) return null;
+  const media = {
+    type: pageEnum(m.type, MEDIA_TYPES, 'type de média'),
+    ids: cleanIds(m.ids),
+    rootFolder: pageText(m.rootFolder, 512, 'dossier racine')
+  };
+  if (media.type === 'series') {
+    media.seasons = cleanSeasons(m.seasons);
+    media.seriesType = isBlank(m.seriesType) ? '' : pageEnum(m.seriesType, SERIES_TYPES, 'type de série');
+  }
+  if (media.type === 'music') {
+    media.artist = pageLabel(m.artist);
+    media.album = pageLabel(m.album);
+    media.year = typeof m.year === 'string' && /^\d{4}$/.test(m.year) ? m.year : '';
+    media.lmode = isBlank(m.lmode) ? 'album' : pageEnum(m.lmode, MUSIC_MODES, 'mode Lidarr');
+  }
+  return media;
+}
+
+// The pages of the extension (options, popup) are told apart from the C411 page by their URL. The shims of the apps give none:
+// everything they relay is treated as coming from the page.
+function isExtensionPage(sender) {
+  const base = chrome.runtime && typeof chrome.runtime.getURL === 'function' ? chrome.runtime.getURL('') : '';
+  return !!base && !!sender && typeof sender.url === 'string' && sender.url.startsWith(base);
+}
+
+function cleanPageMessage(msg, sender) {
+  switch (msg.type) {
+    case 'pageStatus':
+      return { type: msg.type, hash: isBlank(msg.hash) ? '' : pageHash(msg.hash), media: cleanMedia(msg.media) };
+    case 'qbitIndex': {
+      if (isBlank(msg.hashes)) return { type: msg.type, hashes: [] };
+      if (!Array.isArray(msg.hashes) || msg.hashes.length > MAX_INDEX_HASHES) throw refuse('liste de hash invalide');
+      return { type: msg.type, hashes: msg.hashes.filter((h) => typeof h === 'string' && HASH.test(h)).map((h) => h.toLowerCase()) };
+    }
+    case 'toggleTorrent':
+      if (typeof msg.pause !== 'boolean') throw refuse('pause invalide');
+      return { type: msg.type, hash: pageHash(msg.hash), pause: msg.pause };
+    case 'arm':
+      if (!sender || !sender.tab || !Number.isInteger(sender.tab.id)) throw refuse('onglet inconnu');
+      return {
+        type: msg.type, category: pageText(msg.category, 255, 'catégorie'), paused: pageFlag(msg.paused, 'pause'), media: cleanMedia(msg.media)
+      };
+    case 'upload':
+      return {
+        type: msg.type, base64: pageBase64(msg.base64), filename: pageFilename(msg.filename),
+        category: pageText(msg.category, 255, 'catégorie'), paused: pageFlag(msg.paused, 'pause'), media: cleanMedia(msg.media)
+      };
+    case 'arrMeta': {
+      const out = { type: msg.type, service: pageEnum(msg.service, SERVICES, 'service') };
+      if (isExtensionPage(sender) && isObject(msg.cfg)) out.cfg = msg.cfg;
+      return out;
+    }
+    default:
+      return msg;
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
+    if (!msg || typeof msg !== 'object') throw new Error('Message inconnu');
+    msg = cleanPageMessage(msg, sender);
     switch (msg.type) {
       case 'getCategories': {
         const cfg = await getConfig();
