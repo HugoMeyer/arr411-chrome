@@ -1,6 +1,7 @@
 (() => {
   const MARK = 'data-qbt-injected';
   const SCORE = 'data-qbt-score';
+  const BEST_MARK = 'ours-best'; // value of MARK on the « ★ Envoyer le meilleur » button
   const SCORE_TRACK_PX = 60;
   const ARM_TIMEOUT_MS = 20000;
   const MAX_TORRENT_BYTES = 16 * 1024 * 1024; // same limit as the engine and the native layers
@@ -142,6 +143,13 @@
   let statusKey = '';
   let statusRequest = 0;
 
+  // What follows our page button is [★ best button][status badge][score chip]: the first of them goes
+  // after the best button when there is one, so that none of them moves the others back and forth.
+  function afterOurs(ours) {
+    const next = ours.nextElementSibling;
+    return next && next.getAttribute(MARK) === BEST_MARK ? next : ours;
+  }
+
   function badgeEl() {
     const ours = document.querySelector(`button[${MARK}="ours"]`);
     if (!ours) return null;
@@ -152,7 +160,8 @@
         marginLeft: '0.5rem', font: '12px system-ui, sans-serif', verticalAlign: 'middle'
       });
     }
-    if (badge.previousElementSibling !== ours) ours.insertAdjacentElement('afterend', badge);
+    const anchor = afterOurs(ours);
+    if (badge.previousElementSibling !== anchor) anchor.insertAdjacentElement('afterend', badge);
     return badge;
   }
 
@@ -1321,7 +1330,8 @@
       if (stats.box.lastElementChild !== el) stats.box.append(el);
       paintCard(el, entry, scored, group);
     } else {
-      const after = badge && badge.isConnected ? badge : document.querySelector(`button[${MARK}="ours"]`);
+      const ours = document.querySelector(`button[${MARK}="ours"]`);
+      const after = badge && badge.isConnected ? badge : ours && afterOurs(ours);
       if (!after) return;
       if (!el) el = newChip(kind);
       if (after.nextElementSibling !== el) after.insertAdjacentElement('afterend', el);
@@ -1346,6 +1356,7 @@
     const group = scoreWithProfile(entries);
     rows.forEach((r, i) => paintVersion(r, entries[i], group.rows[i], group, live));
     paintPage(stats, entries[at], group.rows[at], group, live);
+    paintBest(rows, entries, group, at, live);
   }
 
   // Adds the score column of a results grid. False when its template can't take one.
@@ -1408,6 +1419,169 @@
     }
   }
 
+  // ---------- « ★ Envoyer le meilleur »: sends the version that earned the ★, from the torrent page ----------
+
+  // ==== best:begin ====
+  // Pure part: nothing in this block touches the DOM. test/best.test.js evaluates it as it is.
+  const BEST_TTL_MS = 20000; // how long a click stays valid while the page of the best version opens
+
+  // The version that earned the ★ (never a dead one), else -1: a single version has nothing to be the best of.
+  function bestIndex(group) {
+    if (!group || !Array.isArray(group.rows) || group.rows.length < 2) return -1;
+    return group.rows.findIndex((r) => !r.dead && r.awards.indexOf('best') !== -1);
+  }
+
+  // The tooltip of the button: what a click sends. info: { current, score, what, size, profile }.
+  function bestTip(info) {
+    const lines = [info.current
+      ? `C’est cette version : la mieux notée (score ${info.score}).`
+      : `Meilleure version : ${[info.what, info.size].filter(Boolean).join(' · ')} — score ${info.score}`];
+    if (info.profile) lines.push(`Profil : ${info.profile}`);
+    return lines.join('\n');
+  }
+
+  // The same on one line, to name the button for screen readers.
+  const bestName = (tip) => `Envoyer le meilleur — ${tip.split('\n').join(' — ')}`;
+
+  // What a click on the button asks for, given the torrent hash the page shows now (intent.from is the hash of the
+  // page the click came from): 'now' (this is the page of the best version), 'wait' (still the page of the click:
+  // its own toast makes a scan run before the router has moved) or 'drop' (the intent expired, is not one, or the
+  // user went to another page).
+  function intentFor(intent, hash, now) {
+    if (!intent || typeof intent.at !== 'number' || typeof intent.hash !== 'string') return 'drop';
+    if (!/^[a-f0-9]{40}$/.test(intent.hash)) return 'drop';
+    const age = now - intent.at;
+    if (!(age >= 0 && age < BEST_TTL_MS)) return 'drop';
+    if (hash === intent.hash) return 'now';
+    return intent.from && hash === intent.from ? 'wait' : 'drop';
+  }
+  // ==== best:end ====
+
+  // Both live in this closure only: the page can't forge an intent, and a reload forgets it.
+  let bestIntent = null; // { hash, from, at, title }: the click on the best version of another page
+  let bestPick = null; // what the button stands for: { current, hash }
+  let bestOpening = false; // the dialog of an automatic opening is on its way or open: the button adds no second one
+
+  // A copy never follows the state of the button it was made from.
+  const NOT_COPIED = ['id', 'disabled', 'data-state', 'data-grace-area-trigger', 'aria-expanded', 'aria-haspopup',
+    'aria-controls'];
+
+  // The first of our page buttons that is on screen (the page may hold a copy of its header per screen size).
+  const visibleOurs = () => [...document.querySelectorAll(`button[${MARK}="ours"]`)].find((b) => b.offsetParent !== null) || null;
+
+  function nativeOf(ours) {
+    for (const [native, mine] of pairs) if (mine === ours && native.isConnected) return native;
+    return null;
+  }
+
+  // The link a version row of the list opens.
+  const rowAnchor = (row) => (row.el.tagName === 'A' ? row.el : row.el.querySelector('a[href*="/torrents/"]'));
+
+  function newBestButton(native) {
+    const el = native.cloneNode(false);
+    for (const attr of NOT_COPIED) el.removeAttribute(attr);
+    el.setAttribute(MARK, BEST_MARK);
+    el.setAttribute(SCORE, 'best');
+    el.style.marginLeft = '0.5rem';
+    el.textContent = '★ Envoyer le meilleur';
+    el.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.isTrusted) sendBest();
+    });
+    return el;
+  }
+
+  // Reads the result of the scoring and changes nothing of it. Nothing is written to the page while the button
+  // already shows what it should.
+  function paintBest(rows, entries, group, at, live) {
+    bestPick = null;
+    const best = bestIndex(group);
+    const ours = visibleOurs();
+    const native = ours && nativeOf(ours);
+    if (best < 0 || !native) return;
+    const pageHash = pageHashFromUrl();
+    const hash = best === at ? pageHash : rows[best].hash;
+    if (!hash) return;
+    const current = hash === pageHash;
+    let size = '';
+    if (!current) {
+      const cell = rows[best].cells.find((c) => parseSize(c.text) !== null);
+      size = cell ? cell.text : formatBytes(entries[best].sizeGB * GIB);
+    }
+    const tip = bestTip({
+      current, score: group.rows[best].score, what: describe(entries[best].release), size, profile: group.profile || ''
+    });
+    let el = document.querySelector(`button[${MARK}="${BEST_MARK}"]`);
+    if (!el) el = newBestButton(native);
+    if (ours.nextElementSibling !== el) ours.insertAdjacentElement('afterend', el);
+    if (!unchanged(el, `${hash}|${tip}`)) {
+      el.title = tip;
+      el.setAttribute('aria-label', bestName(tip));
+    }
+    bestPick = { current, hash };
+    live.add(el);
+  }
+
+  // The URL moves before the page does: the title must differ from the one of the page the click came from.
+  function landed(intent) {
+    const h1 = document.querySelector('h1');
+    const title = h1 ? norm(h1) : '';
+    return !!title && title !== intent.title;
+  }
+
+  function sendBest() {
+    const pick = bestPick;
+    if (!pick || bestOpening) return;
+    if (bestIntent) {
+      // The page of the best version is opening and its dialog comes by itself: until its title is on screen, the
+      // page there is still the old one.
+      if (intentFor(bestIntent, pageHashFromUrl(), Date.now()) === 'now' && !landed(bestIntent)) return;
+      bestIntent = null; // this click wins over the one that is still on its way
+    }
+    if (pick.current || pick.hash === pageHashFromUrl()) {
+      const ours = visibleOurs();
+      const native = ours && nativeOf(ours);
+      if (native) sendToQbit(native);
+      else toast('Bouton de téléchargement introuvable : recharge la page.', true);
+      return;
+    }
+    // The list is read again: what was painted a moment ago may have been replaced since.
+    const row = versionRows().find((r) => r.hash === pick.hash);
+    const link = row && rowAnchor(row);
+    if (!link) { toast('La meilleure version n’est plus dans la liste : réessaie.', true); return; }
+    const h1 = document.querySelector('h1');
+    bestIntent = { hash: pick.hash, from: pageHashFromUrl(), at: Date.now(), title: h1 ? norm(h1) : '' };
+    toast('Ouverture de la meilleure version…', false, true);
+    link.click();
+  }
+
+  // Runs with the scan that follows a quiet spell of the page (see the observer): the router has finished its
+  // render by then. On the page of the best version, once its qBittorrent button is there, opens the dialog of
+  // the send as a click on that button would: the user still confirms.
+  async function openBestIfAwaited() {
+    if (!bestIntent) return;
+    const verdict = intentFor(bestIntent, pageHashFromUrl(), Date.now());
+    if (verdict === 'drop') { bestIntent = null; return; }
+    if (verdict !== 'now') return;
+    const ours = visibleOurs();
+    if (!landed(bestIntent) || !ours || !nativeOf(ours)) return;
+    const { hash } = bestIntent;
+    bestIntent = null;
+    bestOpening = true;
+    try {
+      // The dialog warns about a torrent already in qBittorrent from the status of the page: this page's, not the last one's.
+      await refreshStatus(true);
+      const now = visibleOurs();
+      const native = now && nativeOf(now);
+      if (native && pageHashFromUrl() === hash) await sendToQbit(native);
+    } catch (e) {
+      console.warn('Arr411 : ouverture de la meilleure version impossible', e);
+    } finally {
+      bestOpening = false;
+    }
+  }
+
   function refreshScores() {
     try {
       const live = new Set();
@@ -1457,7 +1631,7 @@
       if (mutations.every(isOwnMutation)) return;
       scheduleInject();
       clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(() => { refreshStatus(); refreshListBadges(); refreshScores(); }, 600);
+      refreshTimer = setTimeout(() => { openBestIfAwaited(); refreshStatus(); refreshListBadges(); refreshScores(); }, 600);
     }).observe(document.documentElement, { childList: true, subtree: true });
     setInterval(() => { if (!document.hidden) refreshListBadges(); }, 30000);
     inject();

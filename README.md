@@ -63,6 +63,8 @@
 
   *Personnalisé* takes the four weights you type (0 to 100 each). On a torrent page the seeders of the other versions aren't shown, so *Ratio (seeders)* ranks that list like *Équilibré*; it makes a difference on result rows.
 
+- **★ Envoyer le meilleur.** On a torrent page, a button next to *qBittorrent* sends the version that holds the ★ for your score profile; its tooltip says which one. If it is another version, its page opens, then the usual send dialog: you still pick the category and confirm, and nothing is sent without that. A pending opening is forgotten after 20 seconds or on a reload. There is no button when there is nothing to compare with.
+
 ### Toolbar popup and notifications
 - **Popup** listing active and recently completed torrents, with pause and resume.
 - **Update notice.** At most every 12 hours the popup reads this repository's public `manifest.json` on GitHub (a plain request: no credential, no extra permission). If it holds a newer version, a banner says so and links to the repository. To update, pull the repository and click **↻** on the extension in `chrome://extensions`. If the check fails, nothing is shown.

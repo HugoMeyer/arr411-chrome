@@ -15,6 +15,9 @@ note chaque version (langue, qualite, seeders, taille). Etoile = meilleur choix,
 qualite/taille, losange = meilleure qualite, eclair = plus de seeders. Clique sur la pastille pour le detail.
 Profil du score : dans Options > "Score des torrents", choisis ce qui compte le plus (Equilibre par defaut, Qualite d'image,
 VF / MULTI d'abord, Petite taille, Ratio, ou Personnalise avec tes propres poids). Le changement s'applique en revenant sur l'onglet C411.
+Bouton "Envoyer le meilleur" : sur la page d'un torrent, a cote de "qBittorrent", il envoie la version qui a l'etoile selon ton profil
+(l'infobulle dit laquelle). Si c'est une autre version, sa page s'ouvre puis le dialogue d'envoi habituel : tu choisis la categorie et tu
+confirmes ; rien n'est envoye sans cela.
 
 Espace disque : le dialogue d'envoi affiche l'espace libre de la categorie choisie et previent, sans bloquer, si le torrent
 ne tient pas (qBittorrent 5.3 ou plus recent ; avant, rien ne s'affiche).
